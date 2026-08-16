@@ -1,0 +1,45 @@
+# --- Vivado / IP packaging junk ---
+*.jou
+*.log
+*.str
+.Xil/
+.ipdefs/
+.ipcache/
+.metadata/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.gen/
+*.sim/
+*.runs/
+*.srcs/managed_ip_project/
+vivado*.jou
+vivado*.log
+webtalk*.log
+webtalk*.jou
+xgui/*.log
+*.pb
+*.dcp
+*.bit
+*.ltx
+*.mmi
+*.rpt
+xsim.dir/
+*.wdb
+*.wcfg
+
+# --- Verilator ---
+obj_dir/
+*.vpd
+*.fst
+*.fst.hier
+
+# --- Synthesis run output (local build tree, not source) ---
+build/
+synth_runs/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
