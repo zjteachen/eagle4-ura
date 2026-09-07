@@ -30,6 +30,7 @@ xsim.dir/
 
 # --- Verilator ---
 obj_dir/
+obj_dir_sim/
 *.vpd
 *.fst
 *.fst.hier

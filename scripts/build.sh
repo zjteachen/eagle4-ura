@@ -5,6 +5,17 @@
 #   ./scripts/build.sh lint  [TOP]                 - Verilator lint/elab
 #                                                     (works in this env,
 #                                                     no Vivado needed)
+#   ./scripts/build.sh sim   [fast]                 - Tier A end-to-end smoke
+#                                                     test (random I/O, real
+#                                                     RTL, Verilator --binary).
+#                                                     "fast" = tiny weight/
+#                                                     scale depth, harness
+#                                                     sanity only (seconds,
+#                                                     not real coverage).
+#                                                     No arg = full hardware-
+#                                                     scale depth (slow, ~tens
+#                                                     of minutes -- see
+#                                                     sim_local/tb/README).
 #   ./scripts/build.sh synth [PART] [TOP] [PERIOD] - Vivado OOC synth
 #                                                     check (needs Vivado
 #                                                     + license on PATH)
@@ -21,6 +32,9 @@ case "$cmd" in
     lint)
         "$IP_DIR/sim_local/run_lint.sh" "$@"
         ;;
+    sim)
+        "$IP_DIR/sim_local/run_sim.sh" "$@"
+        ;;
     synth)
         if ! command -v vivado >/dev/null 2>&1; then
             echo "error: 'vivado' not found on PATH." >&2
@@ -33,10 +47,10 @@ case "$cmd" in
         vivado -mode batch -source "$REPO_ROOT/scripts/synth/run_synth.tcl" -tclargs "$@"
         ;;
     clean)
-        rm -rf "$REPO_ROOT/build" "$IP_DIR/sim_local/obj_dir"
+        rm -rf "$REPO_ROOT/build" "$IP_DIR/sim_local/obj_dir" "$IP_DIR/sim_local/obj_dir_sim"
         ;;
     *)
-        echo "usage: $0 {lint|synth|clean} [args...]" >&2
+        echo "usage: $0 {lint|sim|synth|clean} [args...]" >&2
         exit 1
         ;;
 esac

@@ -1,81 +1,55 @@
-# Build / verification instructions
+# Build & Verification
 
-## Quick reference
+All targets wrap `scripts/build.sh`.
 
-```
-make lint                 # Verilator lint + elaborate all RTL (this env, no Vivado needed)
-make lint TOP=kv_head_wide_win   # lint/elaborate a single submodule as top
+## Quick Reference
 
-make synth                # Vivado OOC synth check (needs Vivado + license, NOT in this dev env)
-make synth PART=xcv80-lsva4737-2MHP-e-S TOP=eagle4_drafter PERIOD=10.0
-
-make clean                # remove build/ output and verilator obj_dir
-```
-
-Both targets are thin wrappers around `scripts/build.sh`; call that directly
-if you don't have `make`.
-
-## 1. Local RTL lint (Verilator) — works in this dev container
-
-Verilator (`sudo dnf install verilator`, v5.046) lints and elaborates the
-full `eagle4_drafter_depthn_1_0/src/*.sv` tree: catches syntax errors, port
-mismatches, width issues, and inferred-latch bugs without needing Vivado or
-the Alveo board.
-
-It does **not** replicate Xilinx synthesis (URAM/BRAM inference, timing
-closure, `Synth-8-xxxx` LUT/RAM sizing errors) — that only shows up under
-`make synth`. Treat a clean lint as "my SystemVerilog is well-formed and
-elaborates," not "this will synthesize/meet timing."
-
-Two Xilinx `XPM` primitives (`xpm_memory_sdpram`, `xpm_memory_sprom`) are
-instantiated directly in `kv_head_wide_win.sv` / `lmdown_gemv_banksplit.sv`.
-Their real definitions live inside a Vivado install and aren't in this repo,
-so `eagle4_drafter_depthn_1_0/sim_local/xpm_memory_stubs.sv` provides
-minimal behavioral stand-ins (same read-latency / read-first semantics,
-covers only the port subset this design actually drives). That file is
-**simulation-only** — it must never be added to `component.xml`'s packaged
-fileset or any synthesis file list, since it would silently shadow the real
-Xilinx macros.
-
-Run directly:
-```
-eagle4_drafter_depthn_1_0/sim_local/run_lint.sh [top_module]
+```bash
+make lint                 # Verilator lint & elaborate eagle4_drafter
+make lint TOP=<module>    # Lint specific submodule
+make sim MODE=fast        # Fast smoke test (~30s, depth=8, sanity only)
+make sim                  # Full smoke test (hardware depth, tens of minutes)
+make synth                # Vivado OOC synthesis (default: V80, 100 MHz; requires Vivado)
+make synth PART=<part> TOP=<top> PERIOD=<ns>
+make clean                # Remove build/ and sim_local/obj_dir*
 ```
 
-## 2. Vivado out-of-context synthesis check — needs Vivado, not available here
+## 1. RTL Lint (Verilator)
 
-`scripts/synth/run_synth.tcl` reads `src/*.sv`, runs
-`synth_design -mode out_of_context`, constrains `ap_clk` at the packaged
-100 MHz (10 ns, per the header note in `eagle4_drafter.sv`), and writes:
+Lints and elaborates SystemVerilog RTL (`eagle4_drafter_depthn_1_0/src/*.sv`) locally without Vivado. Catches syntax errors, port mismatches, width mismatches, and inferred latches. Does not check Vivado primitive inference, mapping, or timing.
 
-```
-build/synth_<TOP>/utilization.rpt
-build/synth_<TOP>/timing_summary.rpt
-build/synth_<TOP>/design_analysis.rpt
-build/synth_<TOP>/<TOP>_synth.dcp
-```
+- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_lint.sh [TOP]`
+- **XPM stubs**: `sim_local/xpm_memory_stubs.sv` stubs `xpm_memory_sdpram` and `xpm_memory_sprom` (`kv_head_wide_win.sv`, `lmdown_gemv_banksplit.sv`). Simulation-only; never include in synthesis filesets or `component.xml`.
 
-Default part is `xcv80-lsva4737-2MHP-e-S` (Alveo V80) — **verify this
-against your installed board/part files** before trusting results:
-```
-vivado -mode tcl -eval 'puts [get_parts *v80*]'
-```
+## 2. End-to-End Simulation (Verilator)
 
-Run on a machine that actually has Vivado + a license:
-```
-module load vivado    # or: source /tools/Xilinx/Vivado/<ver>/settings64.sh
-./scripts/build.sh synth [PART] [TOP] [PERIOD_NS]
-```
+Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`) compiles with `verilator --binary`. Validates I/O plumbing, load paths, control flow, and `OUT_ABI_V24` frontier formatting. Does not evaluate numerical accuracy.
 
-`build/` is gitignored — reports and checkpoints are regenerated, not
-committed.
+- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast]`
+  - `fast`: sets `TEST_WEIGHT_DEPTH=8` and `TEST_SCALE_DEPTH=8` (~30s).
+  - Default: full hardware-scale depth (~14.7M pokes, tens of minutes).
+- **Configuration**: Overrides `G8_SPLICE=0`, `DEPTH_N=0`, `EMBG_EN=0` to single-step execution; exercises write-DMA (`m_axi_out`) without HBM round-trips.
+- **Load paths**: Random weights/scales loaded via direct-drive pins (`boot_we`, `tb_sc_we`); EMB/HFC/GAMMA loaded via AXI4-Lite registers (`sim_local/tb/eagle4_regmap_pkg.sv`). Verified via `dbg_residency.sv`.
+- **Known simulation caveats**:
+  - `SCALE` residency reads 0: `dbg_residency.sv:7686` monitors `dma_sc_we`, missing `tb_sc_we`. Functional data still loads into `scale_bram`.
+  - RoPE table uninitialized: `rope_layer.sv:284, 328` hardcodes missing path `/home/y344shi/eagle4_artifacts/p4/rope_cs.hex`. `cos_t=sin_t=0` zeroes Q/K outputs in `rope_pair_rotate.sv`, rendering downstream output weight-independent.
+  - Performance: ~100–130 µs sim time/s. RTL contains snapshot logic (`SIM_WSNAP`, `+WSNAP_DUMP`, `+WSNAP_LOAD` in `weight_bank_uram.sv`), but it is not yet wired into `run_sim.sh`.
 
-## Recommended flow while iterating on the ISA/datapath
+## 3. Out-of-Context Synthesis (Vivado)
+
+Non-project OOC synthesis via `scripts/synth/run_synth.tcl`. Requires Vivado on `PATH` with valid license (run outside dev container).
+
+- **Execution**: `./scripts/build.sh synth [PART] [TOP] [PERIOD_NS]`
+- **Defaults**:
+  - `PART`: `xcv80-lsva4737-2MHP-e-S` (Alveo V80; verify with `vivado -mode tcl -eval 'puts [get_parts *v80*]'`)
+  - `TOP`: `eagle4_drafter`
+  - `PERIOD_NS`: `10.0` (100 MHz `ap_clk`)
+- **Outputs**: `build/synth_<TOP>/` containing `utilization.rpt`, `timing_summary.rpt`, `design_analysis.rpt`, and `<TOP>_synth.dcp`.
+
+## Iteration Workflow
 
 1. Edit RTL.
-2. `make lint` — fast, catches most mistakes, runs anywhere.
-3. When you have Vivado access: `make synth` — confirms it actually maps to
-   LUTs/BRAM/URAM/DSP on the V80 part and get a timing estimate at 100 MHz.
-4. Full board bring-up / bitstream is out of scope for this repo's local
-   tooling — that still needs the real Vivado IP-packager flow + Alveo V80
-   hardware.
+2. `make lint` — check syntax and elaboration.
+3. `make sim MODE=fast` — verify I/O, control flow, and output framing.
+4. `make sim` — run full hardware-depth smoke test before significant checkpoints.
+5. `make synth` — run on Vivado host to verify utilization and 100 MHz timing.
