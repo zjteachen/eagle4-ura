@@ -401,7 +401,12 @@ module control_regs #(
     input  wire [31:0] batch_b0_lo,          // 0x13c b0  result_q[lane_sel] lo
     input  wire [31:0] batch_b0_hi,          // 0x140 b0  result_q[lane_sel] hi (+canary)
     input  wire [31:0] batch_sib_lo,         // 0x144 sib result_q[lane_sel] lo
-    input  wire [31:0] batch_sib_hi          // 0x148 sib result_q[lane_sel] hi (+canary)
+    input  wire [31:0] batch_sib_hi,          // 0x148 sib result_q[lane_sel] hi (+canary)
+
+    // outputs for ISA PMEM
+    output reg  [31:0] pmem_write_data,
+    output reg  [7:0]  pmem_write_addr,
+    output reg         pmem_we
 );
 
     // ----------------------------------------------------------------
@@ -551,11 +556,15 @@ module control_regs #(
             inj_data_wdata      <= 32'b0;
             inj_sel_we          <= 1'b0;
             inj_sel_wdata       <= 32'b0;
+
             // dbg_cap_val_re is OWNED by the read-data always_ff (default-low + 0xE4
             // pulse, ~line 483/492). Assigning it HERE too made it MULTI-DRIVEN
             // ([Synth 8-6858/6859] in d10g8_dbg) and synth tied it to GND, killing
             // the 0xE4 auto-inc. It self-clears every cycle so it needs no reset here.
             // (removed: dbg_cap_val_re <= 1'b0;)
+            pmem_write_data <= 32'b0;
+            pmem_write_addr <= 8'b0;
+            pmem_we         <= 1'b0;
         end else begin
             // auto-clear ap_start after the kernel picks it up
             if (kernel_busy) ap_start_reg <= 1'b0;
@@ -565,6 +574,13 @@ module control_regs #(
 
             // boot_dma_start is a 1-cycle pulse — default low every cycle
             boot_dma_start <= 1'b0;
+            // pmem_we is a 1-cycle pulse — default low every cycle
+            pmem_we <= 1'b0;
+
+            // Auto-increment write address when a PMEM word commits (wraps at 32 words)
+            if (pmem_we) begin
+                pmem_write_addr <= (pmem_write_addr == 8'd31) ? 8'd0 : (pmem_write_addr + 8'd1);
+            end
 
             // PROBE-V3: sel-write and addr-seek pulses default low every cycle.
             probe_sel_we  <= 1'b0;
@@ -716,6 +732,11 @@ module control_regs #(
                     9'h15c: accfix_cfg <= s_axi_control_wdata[3:0];
                     // OBS_LVL ring read index (word granularity).
                     9'h160: obs_rd_idx <= s_axi_control_wdata[10:0];
+                    // PMEM instruction data mailbox (0x16C)
+                    9'h16c: begin
+                        pmem_write_data <= s_axi_control_wdata;
+                        pmem_we         <= 1'b1;
+                    end
                     default: ;
                 endcase
             end
