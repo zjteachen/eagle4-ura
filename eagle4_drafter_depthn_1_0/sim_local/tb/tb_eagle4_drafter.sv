@@ -341,6 +341,40 @@ module tb_eagle4_drafter #(
         load_vector_via_trio(HFC_WORDS);
         axil_write(ADDR_HFC_SELECT, 0);
 
+        // ---- ISA PMEM loading & instruction fetch verification ----
+        $display("[%0t] ---- testing ISA PMEM loading over AXI (0x168/0x16C) ----", $time);
+        // 1. Reset PMEM write address to 0
+        axil_write(ADDR_PMEM_ADDR, 32'd0);
+        axil_read(ADDR_PMEM_ADDR, rd);
+        $display("  PMEM write_addr reset: got 0x%08x (expect 0x00000000)", rd);
+        if (rd[7:0] !== 8'd0) errors++;
+
+        // 2. Load 4 words (16 instructions) into PMEM via auto-incrementing data mailbox
+        // Word 0 (bytes 0..3): 0x04030201
+        // Word 1 (bytes 4..7): 0x08070605
+        // Word 2 (bytes 8..11): 0x0C0B0A09
+        // Word 3 (bytes 12..15): 0x100F0E0D
+        axil_write(ADDR_PMEM_DATA, 32'h0403_0201);
+        axil_write(ADDR_PMEM_DATA, 32'h0807_0605);
+        axil_write(ADDR_PMEM_DATA, 32'h0C0B_0A09);
+        axil_write(ADDR_PMEM_DATA, 32'h100F_0E0D);
+
+        // Verify write address pointer auto-incremented to 4
+        axil_read(ADDR_PMEM_ADDR, rd);
+        $display("  PMEM write_addr after 4 writes: got 0x%08x (expect 0x00000004)", rd);
+        if (rd[7:0] !== 8'd4) errors++;
+
+        // 3. Verify fetcher initial state: PC=0, instr=0x01 (first byte of word 0)
+        axil_read(ADDR_PMEM_DATA, rd);
+        $display("  PMEM status at PC=0: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect canary=0x504D, PC=0, instr=0x01)",
+                 rd, rd[31:16], rd[14:8], rd[7:0]);
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd0 || rd[7:0] !== 8'h01) begin
+            $display("  FAIL: PMEM fetcher initial word mismatch!");
+            errors++;
+        end else begin
+            $display("  PASS: PMEM loaded and initial instruction 0x01 fetched successfully.");
+        end
+
         // ---- residency self-check: did each load path actually land? ----
         $display("[%0t] ---- residency self-check (dbg_residency.sv) ----", $time);
         read_residency(RES_SEL_EMB,    rd); $display("  EMB    count = %0d (expect %0d)", rd, EMB_WORDS);
@@ -429,6 +463,17 @@ module tb_eagle4_drafter #(
                 errors++;
             end
         end
+        // ---- Verify PC advanced after ap_start launch ----
+        axil_read(ADDR_PMEM_DATA, rd);
+        $display("[%0t] PMEM status post-launch: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect PC=1, instr=0x02)",
+                 $time, rd, rd[31:16], rd[14:8], rd[7:0]);
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd1 || rd[7:0] !== 8'h02) begin
+            $display("  FAIL: PC did not advance to 1 on launch pulse!");
+            errors++;
+        end else begin
+            $display("  PASS: Instruction fetcher stepped PC to 1 and fetched next instruction 0x02.");
+        end
+
 
         if (errors == 0) $display("[%0t] PASS: pipeline ran end-to-end, output parses as a well-formed OUT_ABI_V24 frontier.", $time);
         else              $display("[%0t] FAIL: %0d check(s) failed.", $time, errors);

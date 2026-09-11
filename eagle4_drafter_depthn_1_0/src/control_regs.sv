@@ -406,7 +406,10 @@ module control_regs #(
     // outputs for ISA PMEM
     output reg  [31:0] pmem_write_data,
     output reg  [7:0]  pmem_write_addr,
-    output reg         pmem_we
+    output reg         pmem_we,
+    // observability inputs for ISA PMEM
+    input  wire [7:0]  fetch_instr,
+    input  wire [6:0]  fetch_pc
 );
 
     // ----------------------------------------------------------------
@@ -733,9 +736,14 @@ module control_regs #(
                     // OBS_LVL ring read index (word granularity).
                     9'h160: obs_rd_idx <= s_axi_control_wdata[10:0];
                     // PMEM instruction data mailbox (0x16C)
+                    // PMEM instruction data mailbox (0x16C): write auto-increments write_addr
                     9'h16c: begin
                         pmem_write_data <= s_axi_control_wdata;
                         pmem_we         <= 1'b1;
+                    end
+                    // PMEM address pointer seek (0x168)
+                    9'h168: begin
+                        pmem_write_addr <= s_axi_control_wdata[7:0];
                     end
                     default: ;
                 endcase
@@ -913,6 +921,9 @@ module control_regs #(
                     // OBS_LVL: status (canary+count) and ring data word.
                     9'h160:  s_axi_control_rdata <= obs_status_word;
                     9'h164:  s_axi_control_rdata <= obs_rd_data;
+                    // ISA PMEM status / read-back (0x168: write_addr, 0x16C: {canary, PC, fetch_instr})
+                    9'h168:  s_axi_control_rdata <= {24'b0, pmem_write_addr};
+                    9'h16c:  s_axi_control_rdata <= {16'h504D, 1'b0, fetch_pc, fetch_instr};
                     default: s_axi_control_rdata <= 32'b0;
                 endcase
                 s_axi_control_rvalid <= 1'b1;

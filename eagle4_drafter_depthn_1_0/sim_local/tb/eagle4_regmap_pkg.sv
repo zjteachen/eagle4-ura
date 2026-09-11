@@ -38,6 +38,10 @@ package eagle4_regmap_pkg;
 
     localparam int ADDR_OUT_DMA_STATUS = 'h78; // R bit0=busy,bit1=done,bit2=err,bit3=g8_watchdog_err
 
+    // ---- ISA PMEM mailbox & status ----
+    localparam int ADDR_PMEM_ADDR      = 'h168; // W write_addr pointer | R {24'b0, write_addr}
+    localparam int ADDR_PMEM_DATA      = 'h16c; // W write_data (autoincs write_addr) | R {16'h504D, 1'b0, PC, instr}
+
     // ---- dbg_residency.sv self-check: "did my load actually land" ----
     localparam int ADDR_RES_SEL   = 'hec; // W [2:0] buffer select (0=EMB,1=HFC,2=GAMMA,3=WEIGHT,4=SCALE), bit3=clear pulse
     localparam int ADDR_RES_CRC   = 'hf0; // R

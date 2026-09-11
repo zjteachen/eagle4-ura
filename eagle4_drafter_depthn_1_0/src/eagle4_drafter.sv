@@ -3353,6 +3353,13 @@ module eagle4_drafter #(
     // 0x13c..0x148 <- array result capture, driven in the g_array_scaled block).
     wire [31:0] batch_test_ctrl;
     wire [31:0] batch_b0_lo_w, batch_b0_hi_w, batch_sib_lo_w, batch_sib_hi_w;
+    // ISA PMEM & instruction fetcher wiring
+    wire [31:0] pmem_write_data_w;
+    wire [7:0]  pmem_write_addr_w;
+    wire        pmem_we_w;
+    wire [7:0]  fetch_instr_w;
+    wire [6:0]  fetch_pc_w;
+
     control_regs #(.COL_W(20)) u_ctrl (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .s_axi_control_awaddr(s_axi_control_awaddr), .s_axi_control_awvalid(s_axi_control_awvalid), .s_axi_control_awready(s_axi_control_awready),
@@ -3457,7 +3464,27 @@ module eagle4_drafter #(
         // ---- TREE-BATCH B=2 SILICON BATCH-TEST WINDOW (0x138..0x148) ----
         .batch_test_ctrl(batch_test_ctrl),
         .batch_b0_lo(batch_b0_lo_w),   .batch_b0_hi(batch_b0_hi_w),
-        .batch_sib_lo(batch_sib_lo_w), .batch_sib_hi(batch_sib_hi_w)
+        .batch_sib_lo(batch_sib_lo_w), .batch_sib_hi(batch_sib_hi_w),
+        // ISA PMEM write port & status read-back
+        .pmem_write_data(pmem_write_data_w),
+        .pmem_write_addr(pmem_write_addr_w),
+        .pmem_we(pmem_we_w),
+        .fetch_instr(fetch_instr_w),
+        .fetch_pc(fetch_pc_w)
+    );
+
+    // ================================================================
+    // ISA Prototype Instruction Fetcher with PMEM
+    // ================================================================
+    instruction_fetcher u_fetcher (
+        .clk        (ap_clk),
+        .rst_en     (ap_rst_n),
+        .adv_en     (start_pulse),      // Step PC on each kernel launch pulse
+        .write_en   (pmem_we_w),
+        .write_addr (pmem_write_addr_w),
+        .write_data (pmem_write_data_w),
+        .instr      (fetch_instr_w),
+        .pc_out     (fetch_pc_w)
     );
 
     // ================================================================

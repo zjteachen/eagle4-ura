@@ -9,7 +9,8 @@ module instruction_fetcher (
     input  logic        write_en,   // Active-high PMEM write strobe
     input  logic [7:0]  write_addr, // Target word address in PMEM
     input  logic [31:0] write_data, // 32-bit word written to PMEM
-    output logic [7:0]  instr       // 8-bit (1 byte) instruction output
+    output logic [7:0]  instr,      // 8-bit (1 byte) instruction output
+    output logic [6:0]  pc_out      // Current program counter (0..127)
 );
     // 32 words of 32-bit storage (inferred as distributed RAM)
     // Total capacity = 32 words * 4 bytes/word = 128 bytes of instruction stream
@@ -41,4 +42,5 @@ module instruction_fetcher (
                    (PC[1:0] == 2'b01) ? curr_word[15:8]  :
                    (PC[1:0] == 2'b10) ? curr_word[23:16] :
                                         curr_word[31:24];
+    assign pc_out = PC;
 endmodule
