@@ -1,3 +1,4 @@
+*.patch
 # --- Vivado / IP packaging junk ---
 *.jou
 *.log
@@ -44,3 +45,4 @@ synth_runs/
 .idea/
 *.swp
 .DS_Store
+*.vim

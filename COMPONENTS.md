@@ -291,6 +291,66 @@ DATAPATH PIPELINE                                                               
    +-----------------------------------------------------------------------------------+
 ```
 
+
+## ISA State Encodings & Instruction Set
+
+The instruction fetcher (`instruction_fetcher.sv`) executes byte-granular
+programs out of a 32-word PMEM (128 bytes). Each instruction is one byte:
+`instr[7:5]` is the opcode, `instr[4:0]` is the operand.
+
+| Opcode | Mnemonic | Operand | Behavior |
+| :--- | :--- | :--- | :--- |
+| `000` | STATE | state ID (below) | Pulse the matching stage start; hold until that stage's done advances the PC |
+| `001` | JMP | PMEM word address (0..31) | `PC <- {operand, 2'b00}`; executes in one cycle, target must be word-aligned |
+| `010` | HALT | reserved (0) | Stop execution; one-cycle `halted` pulse (kernel done); PC stays at the HALT byte |
+| `011`-`111` | reserved | — | Decode as HALT (fail-safe stop; an under-programmed PMEM cannot free-run) |
+
+The 5-bit STATE operand selects one of the 20 sequencer states below. The
+values reuse the `top_fsm` state enum numerically, so debug taps
+(`dbg_stage_capture` `top_state`, PMEM status readback) keep their meaning
+across the FSM-to-ISA migration.
+
+| Value | State | Description |
+| :--- | :--- | :--- |
+| `5'd0` | `S_IDLE` | Idle; no stage active. Reserved in ISA mode (a program starts at `PC=0` on `ap_start`, never in IDLE). |
+| `5'd1` | `S_G1` | Draft layer-1 RMSNorm over the hidden-state and embedding streams (three parallel `rmsnorm_block` instances). |
+| `5'd2` | `S_G4` | QKV projection GEMV on the shared array (`stage_sel=0`). |
+| `5'd3` | `S_G5_ROPE` | Rotary embedding on Q/K and KV-cache append; KV-only launches terminate here. |
+| `5'd4` | `S_G6` | Multi-head attention over the windowed KV cache (`stage_sel=1`). |
+| `5'd5` | `S_G7G` | MLP gate projection GEMV (`stage_sel=2`). |
+| `5'd6` | `S_G7U` | MLP up projection GEMV (`stage_sel=3`). |
+| `5'd7` | `S_G7_SILU` | SwiGLU activation, `SiLU(gate) * up`. |
+| `5'd8` | `S_G9` | MLP down projection GEMV + residual add (`stage_sel=4`). |
+| `5'd9` | `S_G11` | Pre-head RMSNorm (`u_rmsnorm_g11`). |
+| `5'd10` | `S_G12` | LM head projection GEMV to cheap vocab logits (`stage_sel=5`). |
+| `5'd11` | `S_TREE` | Speculative tree scan and top-K selection over the cheap logits. |
+| `5'd12` | `S_DONE` | FSM kernel completion. In ISA mode use the HALT instruction instead; executing `STATE 12` stalls (reserved). |
+| `5'd13` | `S_GLM` | Low-rank LM down projection, 3072 -> 256 (`lmdown_gemv_banksplit`). |
+| `5'd14` | `S_G8` | Optional frontier rescore against exact HBM embeddings (G8_SPLICE builds only). Must follow `S_TREE` — the G8 engine launches off `tree_start`. |
+| `5'd15` | `S_LVL_ARM` | Depth-N: initialize the tree-level loop. Reserved in ISA mode (depth-N disabled). |
+| `5'd16` | `S_LVL_FEED` | Depth-N: submit a branch's children to the tree engine. Reserved. |
+| `5'd17` | `S_LVL_SEL` | Depth-N: wait for level frontier selection. Reserved. |
+| `5'd18` | `S_LVL_OUT` | Depth-N: walk the accepted tree for output. Reserved. |
+| `5'd19` | `S_LVL_EMBG` | Depth-N: gather child token embeddings. Reserved. |
+
+Example program — the default linear draft pass (the FSM sequence at
+DEPTH_N=0, G8_SPLICE=0), one byte per instruction:
+
+```text
+byte 0..11: 01 02 03 04 05 06 07 08 09 0D 0A 0B   ; G1 G4 G5 G6 G7G G7U SILU G9 G11 GLM G12 TREE
+byte 12:    40                                      ; HALT
+```
+
+PMEM is programmed through the control register aperture before `ap_start`:
+seek the word write pointer with `0x168`, push words through the `0x16C`
+data mailbox (auto-increment), and read fetcher status (canary, PC, current
+instruction) back from `0x16C`. Each `ap_start` resets `PC` to 0 and runs the
+program to HALT. Jump targets must be word-aligned (multiple of 4 bytes);
+pad with reserved bytes before a target if needed. PMEM writes issued while
+the program is running are ignored by the fetcher (program between launches;
+a mid-run write would combinationaly corrupt the instruction under
+execution). Unwritten PMEM reads as HALT, so a program without a HALT traps
+instead of running off the end.
 ---
 
 ## Component Reference Encyclopedia
@@ -584,6 +644,37 @@ DATAPATH PIPELINE                                                               
 - **`tree_start`**
 - **`g8_start`**
 - `[3:0]` **`stage_sel`**
+
+**Wiring & Hierarchy:**
+- **Instantiated By:** `eagle4_drafter` (`eagle4_drafter.sv`)
+- **Instantiates:** *(Leaf module)*
+
+---
+
+### `instruction_fetcher`
+- **Source File:** `eagle4_drafter_depthn_1_0/src/instruction_fetcher.sv` (118 lines)
+- **Construct Type:** `module`
+- **Technical Purpose:** Program-counter sequencer and PMEM holder for the ISA control flow. Fetches one 8-bit instruction per byte address combinationally (0-cycle fetch) from a 32-word distributed RAM, decodes the 3-bit opcode (STATE / JMP / HALT / reserved-as-HALT), executes word-aligned jumps autonomously, and tracks run/halt state for the kernel busy/done handshake. PMEM is programmed through the `control_regs` 0x168/0x16C aperture; the 5-bit STATE operand is the sequencer state ID (see *ISA State Encodings & Instruction Set* above).
+
+**Parameters:** *(None)*
+
+**Port Interface:**
+
+*Inputs:*
+- **`clk`**
+- **`rst_en`** — active-low synchronous reset
+- **`start_en`** — 1-cycle launch pulse (ap_start): PC <- 0, begin execution
+- **`adv_en`** — advance strobe: the current STATE instruction's stage done
+- **`write_en`** / `[7:0]` **`write_addr`** / `[31:0]` **`write_data`** — PMEM program port
+
+*Outputs:*
+- `[7:0]` **`instr`** — current instruction byte
+- `[6:0]` **`pc_out`** — current program counter (0..127)
+- **`state_pulse`** — 1-cycle pulse when a STATE instruction begins executing
+- `[4:0]` **`state_id`** — state ID of the current STATE instruction
+- **`is_state`** — level: current instruction is STATE and running
+- **`running`** — execution active (start_en .. HALT)
+- **`halted`** — 1-cycle pulse when HALT (or a reserved opcode) executes
 
 **Wiring & Hierarchy:**
 - **Instantiated By:** `eagle4_drafter` (`eagle4_drafter.sv`)
