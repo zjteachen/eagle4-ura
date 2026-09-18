@@ -348,6 +348,8 @@ module eagle4_drafter #(
     wire        accfix_seam_en   = ACCFIX_SEAM_P   && accfix_cfg_w[0];
     wire        accfix_b2p_en    = ACCFIX_B2P_P    && accfix_cfg_w[1];
     wire        accfix_kc_en     = ACCFIX_KC_P     && accfix_cfg_w[2];
+    // kvonly truncation is now expressed by program content (a shorter
+    // ISA program); the reg is kept for the depth-N re-implementation.
     wire        accfix_kvonly_en = ACCFIX_KVONLY_P && accfix_cfg_w[3];
 
     wire [10:0] obs_rd_idx_w;
@@ -1902,7 +1904,7 @@ module eagle4_drafter #(
         .clk        (ap_clk),
         .rst_en     (ap_rst_n),
         .start_en   (start_pulse),
-        .adv_en     (start_pulse),
+        .adv_en     (isa_adv),
         .write_en   (pmem_we_w),
         .write_addr (pmem_write_addr_w),
         .write_data (pmem_write_data_w),
@@ -2057,47 +2059,131 @@ module eagle4_drafter #(
     wire g8_start;
     wire g8_done;
 
-    // Stage scheduler and kernel handshake.
-    top_fsm #(
-        .G8_SPLICE(G8_SPLICE),
-        .DEPTH_N  (DEPTH_N),
-        .K_F      (8),
-        .EMBG_EN  (EMBG_EN),
-        .KVONLY_EN(ACCFIX_KVONLY_P)
-    ) u_fsm (
-        .clk(ap_clk), .rst_n(ap_rst_n),
-        .start(start_pulse), .busy(kernel_busy), .done(kernel_done),
+    // ------------------------------------------------------------------
+    // ISA stage scheduler and kernel handshake.
+    //
+    // The instruction fetcher drives the stage scheduling that top_fsm
+    // used to: a STATE instruction asserts the same one-cycle stage-start
+    // pulse the FSM issued on state entry, and the stage's done advances
+    // the PC to the next instruction. State IDs match the top_fsm state
+    // enum numerically (see COMPONENTS.md "ISA State Encodings &
+    // Instruction Set" and ISA_TESTING_PLAN.md). top_fsm.sv is retained
+    // uninstantiated as the reference for the future depth-N
+    // re-implementation.
+    // ------------------------------------------------------------------
+    localparam logic [4:0] ISA_S_IDLE     = 5'd0;
+    localparam logic [4:0] ISA_S_G1       = 5'd1;
+    localparam logic [4:0] ISA_S_G4       = 5'd2;
+    localparam logic [4:0] ISA_S_G5       = 5'd3;
+    localparam logic [4:0] ISA_S_G6       = 5'd4;
+    localparam logic [4:0] ISA_S_G7G      = 5'd5;
+    localparam logic [4:0] ISA_S_G7U      = 5'd6;
+    localparam logic [4:0] ISA_S_G7_SILU  = 5'd7;
+    localparam logic [4:0] ISA_S_G9       = 5'd8;
+    localparam logic [4:0] ISA_S_G11      = 5'd9;
+    localparam logic [4:0] ISA_S_G12      = 5'd10;
+    localparam logic [4:0] ISA_S_TREE     = 5'd11;
+    localparam logic [4:0] ISA_S_GLM      = 5'd13;
+    localparam logic [4:0] ISA_S_G8       = 5'd14;
 
-        .max_depth      (max_depth),
+    // A STATE instruction stays at its PMEM byte until its stage done
+    // fires. The wait register selects WHICH done advances the PC — a raw
+    // OR of all dones is unsafe: g8_done is a sticky level held high until
+    // the next launch, so it would free-run the PC during the following
+    // pass. Waiting one cycle after issue before sampling also lets
+    // launch-cleared sticky dones (g8_done, cleared by tree_start) drop
+    // first, mirroring the FSM's state-entry-then-sample sequence.
+    reg        isa_wait;
+    reg [4:0]  isa_wait_id;
+    wire       isa_adv;
 
-        .kvonly_i       (accfix_kvonly_en),
-        .lvl_start      (lvl_start_w),
-        .branch_j       (branch_j_w),
-        .level_i        (level_i_w),
-        .branch_feed    (branch_feed_w),
-        .level_done     (lvl_level_done_w),
-        .level_last     (lvl_level_last_w),
-        .tree_all_done  (lvl_tree_done_w),
-        .out_walk_start (out_walk_start_w),
-        .out_walk_done  (lvl_out_walk_done_w),
+    always_ff @(posedge ap_clk) begin
+        if (!ap_rst_n) begin
+            isa_wait    <= 1'b0;
+            isa_wait_id <= ISA_S_IDLE;
+        end else if (isa_state_pulse_w) begin
+            isa_wait    <= 1'b1;
+            isa_wait_id <= isa_state_id_w;
+        end else if (isa_adv) begin
+            isa_wait    <= 1'b0;
+        end
+    end
 
-        .emb_start      (emb_start_w),
-        .emb_done       (emb_done_w),
-        .g1_start(g1_start), .g1_done(g1_done),
-        .g4_start(g4_start), .g4_done(g4_done),
-        .g5_start(g5_start), .g5_done(g5_done),
-        .g6_start(g6_start), .g6_done(g6_done_stage),
-        .g7g_start(g7g_start), .g7g_done(g7g_done_stage),
-        .g7u_start(g7u_start), .g7u_done(g7u_done_stage),
-        .g7p_start(g7p_start), .g7p_done(g7p_done),
-        .g9_start(g9_start), .g9_done(g9_done_stage),
-        .g11_start(g11_start), .g11_done(g11_done),
-        .glm_start(glm_start), .glm_done(glm_done),
-        .g12_start(g12_start), .g12_done(g12_done),
-        .tree_start(tree_start), .tree_done(tree_done),
-        .g8_start(g8_start), .g8_done(g8_done),
-        .stage_sel(stage_sel)
-    );
+    wire isa_done =
+          (isa_wait_id == ISA_S_G1)      ? g1_done        :
+          (isa_wait_id == ISA_S_G4)      ? g4_done        :
+          (isa_wait_id == ISA_S_G5)      ? g5_done        :
+          (isa_wait_id == ISA_S_G6)      ? g6_done_stage  :
+          (isa_wait_id == ISA_S_G7G)     ? g7g_done_stage :
+          (isa_wait_id == ISA_S_G7U)     ? g7u_done_stage :
+          (isa_wait_id == ISA_S_G7_SILU) ? g7p_done       :
+          (isa_wait_id == ISA_S_G9)      ? g9_done_stage  :
+          (isa_wait_id == ISA_S_G11)     ? g11_done       :
+          (isa_wait_id == ISA_S_G12)     ? g12_done       :
+          (isa_wait_id == ISA_S_TREE)    ? tree_done      :
+          (isa_wait_id == ISA_S_GLM)     ? glm_done       :
+          (isa_wait_id == ISA_S_G8)      ? g8_done        : 1'b0;
+    assign isa_adv = isa_wait && isa_done;
+
+    // Stage starts: one-cycle pulse on STATE instruction entry, exactly
+    // like the FSM's state-entry pulses (edge-sensitive consumers include
+    // the seam-FIFO wr_clear pins).
+    assign g1_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G1);
+    assign g4_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G4);
+    assign g5_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G5);
+    assign g6_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G6);
+    assign g7g_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7G);
+    assign g7u_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7U);
+    assign g7p_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7_SILU);
+    assign g9_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G9);
+    assign g11_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G11);
+    assign glm_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_GLM);
+    assign g12_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G12);
+    assign tree_start = isa_state_pulse_w && (isa_state_id_w == ISA_S_TREE);
+    assign g8_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G8);
+
+    // stage_sel decodes the CURRENT instruction for its whole duration
+    // (the byte stays at PC while the stage runs), so it is valid in the
+    // same cycle as the start pulse — matching the FSM's combinational
+    // state decode (same mapping: S_G4->0 ... S_G12->5).
+    assign stage_sel = !isa_is_state_w ? 4'd0 :
+          (isa_state_id_w == ISA_S_G4)  ? 4'd0 :
+          (isa_state_id_w == ISA_S_G6)  ? 4'd1 :
+          (isa_state_id_w == ISA_S_G7G) ? 4'd2 :
+          (isa_state_id_w == ISA_S_G7U) ? 4'd3 :
+          (isa_state_id_w == ISA_S_G9)  ? 4'd4 :
+          (isa_state_id_w == ISA_S_G12) ? 4'd5 : 4'd0;
+
+    // Kernel handshake: busy while the program runs, one-cycle done on
+    // HALT (control_regs clears ap_start off kernel_busy, so start_pulse
+    // is a clean single cycle).
+    assign kernel_busy = isa_running_w;
+    assign kernel_done = isa_halted_w;
+    // Debug tap replacing 5'(u_fsm.state): reports the state ID for the
+    // whole duration of each STATE instruction (0 while idle/at HALT).
+    wire [4:0] isa_dbg_state = isa_is_state_w ? isa_state_id_w : ISA_S_IDLE;
+
+    // Depth-N loop control is not expressible in the current ISA (its
+    // sequencing is data-dependent on branch_j/level_i and the level_done
+    // / level_last / tree_all_done handshakes — see ISA_TESTING_PLAN.md).
+    // Tied off; re-implement from top_fsm.sv when conditional jumps land.
+    assign lvl_start_w      = 1'b0;
+    assign branch_feed_w    = 1'b0;
+    assign out_walk_start_w = 1'b0;
+    assign emb_start_w      = 1'b0;
+    assign branch_j_w       = 3'd0;
+    assign level_i_w        = 4'd0;
+
+    // Fail loudly rather than silently producing no output: with the loop
+    // signals tied off, a DEPTH_N build's tree walk never runs (m_axi_out
+    // is muxed to the tree path) while ap_done still completes. Guard
+    // until conditional-jump support re-enables the loop (ISA_TESTING_PLAN.md).
+    generate if (DEPTH_N) begin : g_depthn_unsupported
+        initial begin
+            $fatal(1, "DEPTH_N=1 is not supported by the ISA scheduler yet (depth-N loop tied off); use a DEPTH_N=0 build");
+        end
+    end endgenerate
+
 
     generate if (DEPTH_N) begin : g_depth_n
 
@@ -4247,7 +4333,7 @@ module eagle4_drafter #(
         logic g8_done_sticky;
         always_ff @(posedge ap_clk) begin
             if (!ap_rst_n)        g8_done_sticky <= 1'b0;
-            else if (g8_launch)   g8_done_sticky <= 1'b0;
+            else if (g8_launch || start_pulse) g8_done_sticky <= 1'b0;
             else if (g8_done_w)   g8_done_sticky <= 1'b1;
         end
         assign g8_done = g8_done_sticky;
@@ -4344,7 +4430,7 @@ module eagle4_drafter #(
     dbg_observe #(.LANES(LANES), .A_WIDTH(A_WIDTH), .G8_ADDR_W(BOOT_AXI_ADDR_W)) u_dbg (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .start_pulse(start_pulse),
-        .top_state(5'(u_fsm.state)),
+        .top_state(isa_dbg_state),
         .g5_state(3'(g5_state)),
         .stage_sel(stage_sel),
         .g1_done(g1_done),   .g4_done(g4_done),   .g5_done(g5_done),

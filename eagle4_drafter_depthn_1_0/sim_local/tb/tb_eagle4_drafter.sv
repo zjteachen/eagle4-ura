@@ -349,15 +349,17 @@ module tb_eagle4_drafter #(
         $display("  PMEM write_addr reset: got 0x%08x (expect 0x00000000)", rd);
         if (rd[7:0] !== 8'd0) errors++;
 
-        // 2. Load 4 words (16 instructions) into PMEM via auto-incrementing data mailbox
-        // Word 0 (bytes 0..3): 0x04030201
-        // Word 1 (bytes 4..7): 0x08070605
-        // Word 2 (bytes 8..11): 0x0C0B0A09
-        // Word 3 (bytes 12..15): 0x100F0E0D
+        // Load the ISA program for the linear draft pass (13 bytes):
+        // bytes 0..11 = STATE G1,G4,G5,G6,G7G,G7U,G7_SILU,G9,G11,GLM,G12,TREE
+        // byte 12 = HALT. State IDs follow the top_fsm enum (G11=9, GLM=13).
+        // Word 0 (bytes 0..3):  G1,G4,G5,G6
+        // Word 1 (bytes 4..7):  G7G,G7U,G7_SILU,G9
+        // Word 2 (bytes 8..11): G11,GLM,G12,TREE
+        // Word 3 (byte 12):     HALT
         axil_write(ADDR_PMEM_DATA, 32'h0403_0201);
         axil_write(ADDR_PMEM_DATA, 32'h0807_0605);
-        axil_write(ADDR_PMEM_DATA, 32'h0C0B_0A09);
-        axil_write(ADDR_PMEM_DATA, 32'h100F_0E0D);
+        axil_write(ADDR_PMEM_DATA, 32'h0B0A_0D09);
+        axil_write(ADDR_PMEM_DATA, 32'h0000_0040);
 
         // Verify write address pointer auto-incremented to 4
         axil_read(ADDR_PMEM_ADDR, rd);
@@ -463,15 +465,52 @@ module tb_eagle4_drafter #(
                 errors++;
             end
         end
-        // ---- Verify PC advanced after ap_start launch ----
+        // ---- Verify program ran to HALT: PC frozen at the HALT byte ----
         axil_read(ADDR_PMEM_DATA, rd);
-        $display("[%0t] PMEM status post-launch: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect PC=1, instr=0x02)",
+        $display("[%0t] PMEM status post-run: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect PC=12, instr=0x40 HALT)",
                  $time, rd, rd[31:16], rd[14:8], rd[7:0]);
-        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd1 || rd[7:0] !== 8'h02) begin
-            $display("  FAIL: PC did not advance to 1 on launch pulse!");
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd12 || rd[7:0] !== 8'h40) begin
+            $display("  FAIL: program did not halt at byte 12!");
             errors++;
         end else begin
-            $display("  PASS: Instruction fetcher stepped PC to 1 and fetched next instruction 0x02.");
+            $display("  PASS: ISA program executed G1..TREE and halted with PC frozen at the HALT byte.");
+        end
+
+        // ---- ISA micro-test: JMP lands on the word-aligned target; a
+        // second ap_start resets the PC and reruns ----
+        $display("[%0t] ---- ISA micro-test: JMP + relaunch ----", $time);
+        // Clear the sticky ap_done from the pipeline run (read-to-clear).
+        axil_read(ADDR_AP_CTRL, rd);
+        if (!rd[1]) begin
+            $display("  FAIL: ap_done not set after the pipeline program HALT!");
+            errors++;
+        end
+        // Program: byte 0 = JMP word 1 (0x21), bytes 1..3 skipped,
+        // byte 4 = HALT. The skipped bytes are STATE S_IDLE (would stall
+        // if executed) — reaching HALT proves the jump really moved the PC.
+        axil_write(ADDR_PMEM_ADDR, 32'd0);
+        axil_write(ADDR_PMEM_DATA, 32'h0000_0021);   // 0x21 = JMP, target word 1
+        axil_write(ADDR_PMEM_DATA, 32'h0000_0040);   // 0x40 = HALT at byte 4
+        axil_write(ADDR_AP_CTRL, 32'h1);
+        begin : wait_isa_done
+            logic [31:0] status;
+            int n;
+            status = '0;
+            for (n = 0; (n < 1000) && !status[1]; n = n + 1)
+                axil_read(ADDR_AP_CTRL, status);
+            if (!status[1]) begin
+                $display("[%0t] FAIL: timeout waiting for ap_done on the JMP micro-test.", $time);
+                errors++;
+            end
+        end
+        axil_read(ADDR_PMEM_DATA, rd);
+        $display("  PMEM status after JMP run: got 0x%08x (PC=%0d, instr=0x%02x; expect PC=4, instr=0x40)",
+                 rd, rd[14:8], rd[7:0]);
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd4 || rd[7:0] !== 8'h40) begin
+            $display("  FAIL: JMP did not land on the word-aligned target!");
+            errors++;
+        end else begin
+            $display("  PASS: JMP executed autonomously to byte 4 and HALT froze the PC there.");
         end
 
 
