@@ -1778,6 +1778,11 @@ module eagle4_drafter #(
     wire        pmem_we_w;
     wire [7:0]  fetch_instr_w;
     wire [6:0]  fetch_pc_w;
+    wire        isa_state_pulse_w;
+    wire [4:0]  isa_state_id_w;
+    wire        isa_is_state_w;
+    wire        isa_running_w;
+    wire        isa_halted_w;
 
     // AXI4-Lite register file.
     control_regs #(.COL_W(20)) u_ctrl (
@@ -1896,12 +1901,18 @@ module eagle4_drafter #(
     instruction_fetcher u_fetcher (
         .clk        (ap_clk),
         .rst_en     (ap_rst_n),
+        .start_en   (start_pulse),
         .adv_en     (start_pulse),
         .write_en   (pmem_we_w),
         .write_addr (pmem_write_addr_w),
         .write_data (pmem_write_data_w),
         .instr      (fetch_instr_w),
-        .pc_out     (fetch_pc_w)
+        .pc_out     (fetch_pc_w),
+        .state_pulse(isa_state_pulse_w),
+        .state_id   (isa_state_id_w),
+        .is_state   (isa_is_state_w),
+        .running    (isa_running_w),
+        .halted     (isa_halted_w)
     );
 
     generate
