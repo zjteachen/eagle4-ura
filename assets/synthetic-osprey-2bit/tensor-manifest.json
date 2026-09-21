@@ -1,0 +1,226 @@
+{
+  "synthetic": true,
+  "fill": "all-zero bytes",
+  "source_variant": "local 2bit_ckpt archive; BF16 not verified",
+  "tensors": [
+    {
+      "name": "midlayer.mlp.down_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.mlp.gate_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.mlp.up_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.self_attn.k_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.self_attn.o_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.self_attn.q_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "midlayer.self_attn.v_proj.weight_scale",
+      "shape": [
+        1
+      ],
+      "dtype": "F32",
+      "elements": 1,
+      "bytes": 4
+    },
+    {
+      "name": "embed_tokens.weight",
+      "shape": [
+        128256,
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 394002432,
+      "bytes": 788004864
+    },
+    {
+      "name": "fc.fc.weight",
+      "shape": [
+        3072,
+        9216
+      ],
+      "dtype": "BF16",
+      "elements": 28311552,
+      "bytes": 56623104
+    },
+    {
+      "name": "fc.norm.0.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "fc.norm.1.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "fc.norm.2.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "midlayer.hidden_norm.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "midlayer.input_layernorm.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "midlayer.post_attention_layernorm.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "lm_head.weight",
+      "shape": [
+        128256,
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 394002432,
+      "bytes": 788004864
+    },
+    {
+      "name": "norm.weight",
+      "shape": [
+        3072
+      ],
+      "dtype": "BF16",
+      "elements": 3072,
+      "bytes": 6144
+    },
+    {
+      "name": "midlayer.mlp.down_proj.qweight",
+      "shape": [
+        6291456
+      ],
+      "dtype": "U8",
+      "elements": 6291456,
+      "bytes": 6291456
+    },
+    {
+      "name": "midlayer.mlp.gate_proj.qweight",
+      "shape": [
+        6291456
+      ],
+      "dtype": "U8",
+      "elements": 6291456,
+      "bytes": 6291456
+    },
+    {
+      "name": "midlayer.mlp.up_proj.qweight",
+      "shape": [
+        6291456
+      ],
+      "dtype": "U8",
+      "elements": 6291456,
+      "bytes": 6291456
+    },
+    {
+      "name": "midlayer.self_attn.k_proj.qweight",
+      "shape": [
+        4718592
+      ],
+      "dtype": "U8",
+      "elements": 4718592,
+      "bytes": 4718592
+    },
+    {
+      "name": "midlayer.self_attn.o_proj.qweight",
+      "shape": [
+        2359296
+      ],
+      "dtype": "U8",
+      "elements": 2359296,
+      "bytes": 2359296
+    },
+    {
+      "name": "midlayer.self_attn.q_proj.qweight",
+      "shape": [
+        4718592
+      ],
+      "dtype": "U8",
+      "elements": 4718592,
+      "bytes": 4718592
+    },
+    {
+      "name": "midlayer.self_attn.v_proj.qweight",
+      "shape": [
+        4718592
+      ],
+      "dtype": "U8",
+      "elements": 4718592,
+      "bytes": 4718592
+    }
+  ]
+}

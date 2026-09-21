@@ -1,0 +1,9 @@
+{
+  "tensor_count": 24,
+  "stored_elements": 851727367,
+  "payload_bytes": 1668065308,
+  "layout_matches_source_header": false,
+  "layout_matches_manifest": true,
+  "entire_payload_verified_zero": true,
+  "trained_values_copied": false
+}
