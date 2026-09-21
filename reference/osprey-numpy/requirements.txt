@@ -1,0 +1,2 @@
+# Runtime: NumPy only. Tests: Python standard library `unittest` (no pytest needed; pytest also collects them).
+numpy>=1.26,<3
