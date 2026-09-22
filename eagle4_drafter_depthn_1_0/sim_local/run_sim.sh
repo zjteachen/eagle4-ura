@@ -4,6 +4,8 @@
 # (sim_local/tb/tb_eagle4_drafter.sv) with Verilator.
 #
 # Usage:
+#   ./run_sim.sh g1           # upload STATE G1; HALT over AXI-Lite; check
+#                              #   isolated RMSNorm execution (no weights)
 #   ./run_sim.sh              # full depth: real WEIGHT/SCALE bank sizes
 #                              #   (~14.7M direct-drive pokes -- slow, but
 #                              #   the true load, matching real hardware)
@@ -20,9 +22,12 @@ SRC_DIR="$(cd ../src && pwd)"
 BUILD_DIR="obj_dir_sim"
 
 DEPTH_ARGS=()
+SIM_ARGS=()
 if [[ "${1:-}" == "fast" ]]; then
     echo "== fast mode: TEST_WEIGHT_DEPTH=8 TEST_SCALE_DEPTH=8 (harness sanity only) =="
     DEPTH_ARGS=(-GTEST_WEIGHT_DEPTH=8 -GTEST_SCALE_DEPTH=8)
+elif [[ "${1:-}" == "g1" ]]; then
+    SIM_ARGS=(+G1_ONLY)
 fi
 
 verilator --binary --timing -Wno-fatal \
@@ -38,4 +43,4 @@ verilator --binary --timing -Wno-fatal \
     -Mdir "$BUILD_DIR" \
     -o sim_tb
 
-"$BUILD_DIR/sim_tb"
+"$BUILD_DIR/sim_tb" "${SIM_ARGS[@]}"

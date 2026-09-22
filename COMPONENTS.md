@@ -313,7 +313,7 @@ across the FSM-to-ISA migration.
 | Value | State | Description |
 | :--- | :--- | :--- |
 | `5'd0` | `S_IDLE` | Idle; no stage active. Reserved in ISA mode (a program starts at `PC=0` on `ap_start`, never in IDLE). |
-| `5'd1` | `S_G1` | Draft layer-1 RMSNorm over the hidden-state and embedding streams (three parallel `rmsnorm_block` instances). |
+| `5'd1` | `S_G1` | Separate 3072-element RMSNorms over hidden-state and embedding streams (two parallel `rmsnorm_block` instances with DEPTH_N=0; a third embedding-requantization instance exists only with DEPTH_N=1). No QKV projection; that is G4. |
 | `5'd2` | `S_G4` | QKV projection GEMV on the shared array (`stage_sel=0`). |
 | `5'd3` | `S_G5_ROPE` | Rotary embedding on Q/K and KV-cache append; KV-only launches terminate here. |
 | `5'd4` | `S_G6` | Multi-head attention over the windowed KV cache (`stage_sel=1`). |

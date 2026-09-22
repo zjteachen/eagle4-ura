@@ -7,6 +7,7 @@ All targets wrap `scripts/build.sh`.
 ```bash
 make lint                 # Verilator lint & elaborate eagle4_drafter
 make lint TOP=<module>    # Lint specific submodule
+make sim MODE=g1          # Isolated ISA test: STATE G1; HALT (no weight load)
 make sim MODE=fast        # Fast smoke test (~30s, depth=8, sanity only)
 make sim                  # Full smoke test (hardware depth, tens of minutes)
 make synth                # Vivado OOC synthesis (default: V80, 100 MHz; requires Vivado)
@@ -25,9 +26,16 @@ Lints and elaborates SystemVerilog RTL (`eagle4_drafter_depthn_1_0/src/*.sv`) lo
 
 Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`) compiles with `verilator --binary`. Validates I/O plumbing, load paths, control flow, and `OUT_ABI_V24` frontier formatting. Does not evaluate numerical accuracy.
 
-- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast]`
+- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast|g1]`
   - `fast`: sets `TEST_WEIGHT_DEPTH=8` and `TEST_SCALE_DEPTH=8` (~30s).
   - Default: full hardware-scale depth (~14.7M pokes, tens of minutes).
+  - `g1`: uploads `STATE G1; HALT` through AXI-Lite, loads deterministic
+    full-size hidden/embedding vectors and their two gamma vectors, and skips
+    WEIGHT/SCALE loading. Checks one G1 launch, 192 ordered output chunks per
+    norm, completion before HALT, PC=1, idle/read-to-clear status, and no later
+    stage starts or external DMA. Failures and timeouts exit nonzero. This is
+    an ISA execution test, not a numerical-reference comparison; see
+    `ISA_TESTING_PLAN.md` for the G1 arithmetic/reference proposal.
 - **Configuration**: Overrides `G8_SPLICE=0`, `DEPTH_N=0`, `EMBG_EN=0` to single-step execution; exercises write-DMA (`m_axi_out`) without HBM round-trips.
 - **Load paths**: Random weights/scales loaded via direct-drive pins (`boot_we`, `tb_sc_we`); EMB/HFC/GAMMA loaded via AXI4-Lite registers (`sim_local/tb/eagle4_regmap_pkg.sv`). Verified via `dbg_residency.sv`.
 - **Known simulation caveats**:

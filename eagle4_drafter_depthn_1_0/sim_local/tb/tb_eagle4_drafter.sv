@@ -300,12 +300,135 @@ module tb_eagle4_drafter #(
         axil_read(ADDR_RES_COUNT, count);
     endtask
 
+    // Isolated ISA contract: STATE G1 must finish both full-width norms,
+    // then HALT without launching a downstream stage or external DMA.
+    // Use the clean output strobes, not rmsnorm_apply's delayed out_valid.
+    bit g1_test_active = 1'b0;
+    int g1_starts = 0, g1_completions = 0, g1e_completions = 0;
+    int g1_h_chunks = 0, g1_e_chunks = 0, g1_halts = 0;
+    localparam int G1_CHUNKS = D_MODEL / K_PAR;
+
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && g1_test_active) begin
+            if (dut.g4_start || dut.g5_start || dut.g6_start ||
+                dut.g7g_start || dut.g7u_start || dut.g7p_start ||
+                dut.g9_start || dut.g11_start || dut.glm_start ||
+                dut.g12_start || dut.tree_start || dut.g8_start)
+                $fatal(1, "G1-only: a downstream stage started");
+            if (out_awvalid || out_wvalid || m_axi_boot_arvalid_u ||
+                m_axi_g8_arvalid_u || m_axi_g8b_arvalid_u ||
+                m_axi_emb_arvalid_u || m_axi_embb_arvalid_u)
+                $fatal(1, "G1-only: unexpected external-memory transaction");
+            if (dut.g1_start) g1_starts <= g1_starts + 1;
+            if (dut.u_rmsnorm_g1.out_chunk_strobe) begin
+                if (dut.u_rmsnorm_g1.out_chunk_idx_o != g1_h_chunks)
+                    $fatal(1, "G1-only: hidden output chunks out of order");
+                g1_h_chunks <= g1_h_chunks + 1;
+            end
+            if (dut.u_rmsnorm_g1_e.out_chunk_strobe) begin
+                if (dut.u_rmsnorm_g1_e.out_chunk_idx_o != g1_e_chunks)
+                    $fatal(1, "G1-only: embedding output chunks out of order");
+                g1_e_chunks <= g1_e_chunks + 1;
+            end
+            if (dut.g1_done) g1_completions <= g1_completions + 1;
+            if (dut.g1e_done) g1e_completions <= g1e_completions + 1;
+            if (dut.kernel_busy && g1_completions == 0 && dut.fetch_pc_w != 0)
+                $fatal(1, "G1-only: PC advanced before G1 completed");
+            if (dut.kernel_done) begin
+                if (g1_completions != 1 || g1e_completions != 1 ||
+                    g1_h_chunks != G1_CHUNKS || g1_e_chunks != G1_CHUNKS)
+                    $fatal(1, "G1-only: HALT before both full vectors completed");
+                g1_halts <= g1_halts + 1;
+            end
+        end
+    end
+
+    // Covers stuck AXI handshakes during upload as well as execution hangs.
+    initial begin
+        if ($test$plusargs("G1_ONLY")) begin
+            repeat (200_000) @(posedge ap_clk);
+            $fatal(1, "G1-only: global watchdog expired");
+        end
+    end
+
+    task automatic run_g1_only();
+        logic [31:0] rd;
+        logic signed [15:0] lo, hi;
+        $display("[%0t] ---- ISA micro-test: STATE G1; HALT ----", $time);
+
+        // Two 3072-element vectors, not three raw target-layer features:
+        // h_fc_buf is the already-projected hidden input consumed by G1.
+        // Signed, deterministic data; gamma=1 in Q4.12 for both norms.
+        axil_write(ADDR_HFC_SELECT, 0);
+        axil_write(ADDR_EMB_SELECT, 0);
+        axil_write(ADDR_GAMMA_SEL, GAMMA_HIDDEN_NORM);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        repeat (GAMMA_WORDS) axil_write(ADDR_BOOT_WR_DATA, 32'h1000_1000);
+        axil_write(ADDR_GAMMA_SEL, GAMMA_E_NORM);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        repeat (GAMMA_WORDS) axil_write(ADDR_BOOT_WR_DATA, 32'h1000_1000);
+        axil_write(ADDR_GAMMA_SEL, 0);
+        axil_write(ADDR_EMB_SELECT, 1);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        for (int i = 0; i < WORDS_PER_VECTOR; i++) begin
+            lo = 16'(512 + i);
+            hi = -lo;
+            axil_write(ADDR_BOOT_WR_DATA, {hi, lo});
+        end
+        axil_write(ADDR_EMB_SELECT, 0);
+        axil_write(ADDR_HFC_SELECT, 1);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        for (int i = 0; i < WORDS_PER_VECTOR; i++) begin
+            lo = -16'(512 + i);
+            hi = -lo;
+            axil_write(ADDR_BOOT_WR_DATA, {hi, lo});
+        end
+        axil_write(ADDR_HFC_SELECT, 0);
+        read_residency(RES_SEL_EMB, rd);
+        if (rd !== WORDS_PER_VECTOR) $fatal(1, "G1-only: EMB upload incomplete");
+        read_residency(RES_SEL_HFC, rd);
+        if (rd !== WORDS_PER_VECTOR) $fatal(1, "G1-only: HFC upload incomplete");
+        read_residency(RES_SEL_GAMMA, rd);
+        if (rd !== 2*GAMMA_WORDS) $fatal(1, "G1-only: gamma upload incomplete");
+
+        // Little-endian bytes: 01=STATE G1, 40=HALT; HALT padding.
+        axil_write(ADDR_PMEM_ADDR, 0);
+        axil_write(ADDR_PMEM_DATA, 32'h4040_4001);
+        // AXI B precedes the registered PMEM commit. Wait for its pointer
+        // increment before reading the combinational instruction fetch.
+        rd = 0;
+        for (int n = 0; n < 10 && rd != 1; n++) axil_read(ADDR_PMEM_ADDR, rd);
+        if (rd !== 32'd1) $fatal(1, "G1-only: PMEM upload did not commit");
+        axil_read(ADDR_PMEM_DATA, rd);
+        if (rd !== 32'h504D_0001) $fatal(1, "G1-only: initial PMEM status %08x", rd);
+        g1_test_active = 1'b1;
+        axil_write(ADDR_AP_CTRL, 1);
+        rd = 0;
+        for (int n = 0; n < 2000 && !rd[1]; n++) axil_read(ADDR_AP_CTRL, rd);
+        if (!rd[1]) $fatal(1, "G1-only: timeout waiting for ap_done");
+
+        // Leave the monitor armed after HALT to catch fall-through/relaunch.
+        repeat (20) @(posedge ap_clk);
+        axil_read(ADDR_AP_CTRL, rd);
+        if (rd[1] || !rd[2] || !rd[3])
+            $fatal(1, "G1-only: expected idle/ready with ap_done cleared, got %08x", rd);
+        axil_read(ADDR_PMEM_DATA, rd);
+        if (rd !== 32'h504D_0140) $fatal(1, "G1-only: expected HALT at PC=1, got %08x", rd);
+        @(negedge ap_clk);
+        if (g1_starts != 1 || g1_completions != 1 || g1e_completions != 1 ||
+            g1_halts != 1 || g1_h_chunks != G1_CHUNKS || g1_e_chunks != G1_CHUNKS)
+            $fatal(1, "G1-only: starts=%0d done_h/e=%0d/%0d halts=%0d chunks_h/e=%0d/%0d",
+                   g1_starts, g1_completions, g1e_completions, g1_halts, g1_h_chunks, g1_e_chunks);
+        $display("[%0t] PASS: STATE G1 only; hidden/embedding chunks=%0d/%0d; one HALT at PC=1; no downstream starts or DMA.",
+                 $time, g1_h_chunks, g1_e_chunks);
+    endtask
+
     // ================================================================
     // Main sequence
     // ================================================================
     localparam int TIMEOUT_CYCLES = 30_000_000;
 
-    initial begin
+    initial begin : main_sequence
         logic [31:0] rd;
         int errors;
         errors = 0;
@@ -316,6 +439,12 @@ module tb_eagle4_drafter #(
 
         @(posedge ap_rst_n);
         repeat (5) @(posedge ap_clk);
+
+        if ($test$plusargs("G1_ONLY")) begin
+            run_g1_only();
+            $finish;
+            disable main_sequence;
+        end
 
         $display("[%0t] ---- loading WEIGHT banks (%0d lanes x %0d words) ----", $time, LANES, W_DEPTH);
         load_all_weight_banks();

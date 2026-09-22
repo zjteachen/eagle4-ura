@@ -5,7 +5,7 @@
 #   ./scripts/build.sh lint  [TOP]                 - Verilator lint/elab
 #                                                     (works in this env,
 #                                                     no Vivado needed)
-#   ./scripts/build.sh sim   [fast]                 - Tier A end-to-end smoke
+#   ./scripts/build.sh sim   [fast|g1]              - Tier A end-to-end smoke
 #                                                     test (random I/O, real
 #                                                     RTL, Verilator --binary).
 #                                                     "fast" = tiny weight/
@@ -16,6 +16,8 @@
 #                                                     scale depth (slow, ~tens
 #                                                     of minutes -- see
 #                                                     sim_local/tb/README).
+#                                                     "g1" = isolated ISA
+#                                                     STATE G1; HALT test.
 #   ./scripts/build.sh synth [PART] [TOP] [PERIOD] - Vivado OOC synth
 #                                                     check (needs Vivado
 #                                                     + license on PATH)
