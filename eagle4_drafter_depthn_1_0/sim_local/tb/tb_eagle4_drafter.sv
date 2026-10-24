@@ -1066,6 +1066,32 @@ module tb_eagle4_drafter #(
         if (!st[2] || st[1] || st[0])
             $fatal(1, "GEMV E2: bad status %08x (want ERROR only)", st);
 
+        // E4: fixed qzero is 1; qzero=0 must be rejected.
+        gv_reset();
+        gv_config(0, 0, 1, 8, 8, 0, 0, 1, 0, 13);
+        gv_wrsr(9, (1 << 11) | (0 << 7) | (0 << 5) | 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
+            $fatal(1, "GEMV E4: qzero=0 launched (starts=%0d tiles=%0d err=%0d)",
+                   gv_starts, gv_tiles, gv_errors);
+        if (!st[2] || st[1] || st[0])
+            $fatal(1, "GEMV E4: bad status %08x (want ERROR only)", st);
+
+        // E5: output_conversion is fixed at 0; 1 must be rejected.
+        gv_reset();
+        gv_config(0, 0, 1, 8, 8, 0, 0, 1, 0, 13);
+        gv_wrsr(10, 1);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
+            $fatal(1, "GEMV E5: conversion=1 launched (starts=%0d tiles=%0d err=%0d)",
+                   gv_starts, gv_tiles, gv_errors);
+        if (!st[2] || st[1] || st[0])
+            $fatal(1, "GEMV E5: bad status %08x (want ERROR only)", st);
+
         // E3: restart after errors clears sticky ERROR and runs again.
         gv_reset();
         gv_config(0, 0, 1, 8, 8, 0, 0, 1, 9, 13);
@@ -1077,7 +1103,7 @@ module tb_eagle4_drafter #(
         if (gv_starts != 1 || gv_errors != 0)
             $fatal(1, "GEMV E3: restart starts=%0d errors=%0d", gv_starts, gv_errors);
         gv_check_pc(gv_nb - 1);
-        $display("[%0t] PASS GEMV E: invalid cpg/frac terminate without launch; restart clears ERROR",
+        $display("[%0t] PASS GEMV E: invalid cpg/frac/qzero/conversion terminate without launch; restart clears ERROR",
                  $time);
 
         $display("[%0t] PASS: shared GEMV cutover (A-D) and error/restart (E); real banks, AXI PMEM, all-lane oracle.",
