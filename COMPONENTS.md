@@ -382,7 +382,7 @@ current launch path for the retired rows.
 | `5'd7` | `S_G7_SILU` | SwiGLU activation, `SiLU(gate) * up`. |
 | `5'd8` | `S_G9` | **Retired STATE ID.** Down projection is `GEMV` with source 5, destination 6; 24 tiles (48 with FORREASON). |
 | `5'd9` | `S_G11` | Pre-head RMSNorm (`u_rmsnorm_g11`). |
-| `5'd10` | `S_G12` | LM head projection GEMV to cheap vocab logits (`stage_sel=5`). |
+| `5'd10` | `S_G12` | **Retired STATE ID.** The LM-head GEMV is driven tile-by-tile by TREE as a client of the same configured engine. |
 | `5'd11` | `S_TREE` | Speculative tree scan and top-K selection over the cheap logits. |
 | `5'd12` | `S_DONE` | FSM kernel completion. In ISA mode use the HALT instruction instead; executing `STATE 12` stalls (reserved). |
 | `5'd13` | `S_GLM` | Low-rank LM down projection, 3072 -> 256 (`lmdown_gemv_banksplit`). |
@@ -397,7 +397,7 @@ Example program — the default linear draft pass (the FSM sequence at
 DEPTH_N=0, G8_SPLICE=0), one byte per instruction:
 
 ```text
-byte 0..11: 01 02 03 04 05 06 07 08 09 0D 0A 0B   ; G1 G4 G5 G6 G7G G7U SILU G9 G11 GLM G12 TREE
+byte 0..11: 01 03 05 06 07 08 0B 0D 09 0E ...   ; current program uses WRSR+GEMV; see ISA.md. Retired STATE IDs decode as HALT.
 byte 12:    40                                      ; HALT
 ```
 

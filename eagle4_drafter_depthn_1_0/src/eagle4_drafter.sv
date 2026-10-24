@@ -384,7 +384,7 @@ module eagle4_drafter #(
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
             .tree_start(tree_start_eff),
-            .n_tiles_cfg(n_tiles_cfg),
+            .n_tiles_cfg(gemv_client_scan_tiles_w),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
             .gemv_tile_start(tt_gemv_start),
@@ -404,7 +404,7 @@ module eagle4_drafter #(
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
             .tree_start(tree_start_eff),
-            .n_tiles_cfg(n_tiles_cfg),
+            .n_tiles_cfg(gemv_client_scan_tiles_w),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
             .gemv_tile_start(tt_gemv_start),
@@ -446,7 +446,7 @@ module eagle4_drafter #(
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
             .tree_start(tree_start_eff),
-            .n_tiles_cfg(n_tiles_cfg),
+            .n_tiles_cfg(gemv_client_scan_tiles_w),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
             .gemv_tile_start(tt_gemv_start),
@@ -467,7 +467,7 @@ module eagle4_drafter #(
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
             .tree_start(tree_start_eff),
-            .n_tiles_cfg(n_tiles_cfg),
+            .n_tiles_cfg(gemv_client_scan_tiles_w),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
             .gemv_tile_start(tt_gemv_start),
@@ -1842,6 +1842,7 @@ module eagle4_drafter #(
     wire        gemv_store_ack_w;
     wire        gemv_client_error_w;
     wire        gemv_client_cfg_ok_w;
+    wire [15:0] gemv_client_scan_tiles_w;
     wire        gemv_op_start_w;
     wire [3:0]  gemv_op_start_dest_w;
     wire        gemv_op_done_w;
@@ -2305,6 +2306,7 @@ module eagle4_drafter #(
         .cfg_qzero_raw(sr_qzero_raw_w),
         .cfg_scale_frac(sr_scale_frac_w),
         .cfg_output_conversion(sr_output_conversion_w),
+        .weight_base_align(16'(GEMV_KPAR64 ? 4 : 1)),
         .act_ready(gemv_act_ready_w),
         .array_done(array_done),
         .array_start(gemv_array_start_w),
@@ -2322,6 +2324,9 @@ module eagle4_drafter #(
         .client_tile_idx(tt_gemv_tile_idx),
         .client_error(gemv_client_error_w),
         .client_config_ok(gemv_client_cfg_ok_w),
+        .client_scan_tiles(gemv_client_scan_tiles_w),
+        .client_n_tiles_cfg(n_tiles_cfg),
+        .client_session_done(tree_done),
         .busy(gemv_busy_w),
         .done_sticky(gemv_done_w),
         .error_sticky(gemv_error_w),
@@ -2726,16 +2731,36 @@ module eagle4_drafter #(
 
     wire [PREMLP_CW-1:0] premlp_rd_idx_b = act_addr_b_w[PREMLP_CW-1:0];
 
-    // HFC / input-embedding banks are combinational array reads; register
-    // them once to match the RD_LAT=1 seam buffers on the other sources.
-    reg signed [K_PAR*A_WIDTH-1:0] hfc_act_rd_w,  hfc_act_rd_b_w;
-    reg signed [K_PAR*A_WIDTH-1:0] emb_act_rd_w,  emb_act_rd_b_w;
-    always_ff @(posedge ap_clk) begin
-        hfc_act_rd_w   <= h_fc_buf_rd(act_addr_w[EMB_CW-1:0]);
-        hfc_act_rd_b_w <= h_fc_buf_rd(act_addr_b_w[EMB_CW-1:0]);
-        emb_act_rd_w   <= input_emb_buf_rd(act_addr_w[EMB_CW-1:0]);
-        emb_act_rd_b_w <= input_emb_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+    // HFC / input-embedding banks are asynchronous array reads. Their
+    // adapter latency must match the COMPILED array/consumer contract:
+    //   * scaled SLR array + registered activation source buffers (production
+    //     D1_RDLAT=1): one register, same as the other RD_LAT=1 seams;
+    //   * unscaled/K_PAR64 arrays (lane consumes the current chunk
+    //     combinationally) or D1_RDLAT=0: combinational, no fake delay.
+    localparam bit GEMV_SRC_REG = GEMV_SCALED && !GEMV_KPAR64 && SLR_SAFE &&
+                                  D1_RDLAT;
+    wire signed [K_PAR*A_WIDTH-1:0] hfc_act_rd_w,  hfc_act_rd_b_w;
+    wire signed [K_PAR*A_WIDTH-1:0] emb_act_rd_w,  emb_act_rd_b_w;
+    generate
+    if (GEMV_SRC_REG) begin : g_act_src_reg
+        reg signed [K_PAR*A_WIDTH-1:0] hfc_r, hfc_rb, emb_r, emb_rb;
+        always_ff @(posedge ap_clk) begin
+            hfc_r  <= h_fc_buf_rd(act_addr_w[EMB_CW-1:0]);
+            hfc_rb <= h_fc_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+            emb_r  <= input_emb_buf_rd(act_addr_w[EMB_CW-1:0]);
+            emb_rb <= input_emb_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+        end
+        assign hfc_act_rd_w   = hfc_r;
+        assign hfc_act_rd_b_w = hfc_rb;
+        assign emb_act_rd_w   = emb_r;
+        assign emb_act_rd_b_w = emb_rb;
+    end else begin : g_act_src_comb
+        assign hfc_act_rd_w   = h_fc_buf_rd(act_addr_w[EMB_CW-1:0]);
+        assign hfc_act_rd_b_w = h_fc_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+        assign emb_act_rd_w   = input_emb_buf_rd(act_addr_w[EMB_CW-1:0]);
+        assign emb_act_rd_b_w = input_emb_buf_rd(act_addr_b_w[EMB_CW-1:0]);
     end
+    endgenerate
 
     wire signed [K_PAR*A_WIDTH-1:0] a_chunk_src =
           (gemv_act_src_w == 3'd0) ? a_chunk
@@ -3082,8 +3107,11 @@ module eagle4_drafter #(
     wire gemv_store_ack_imm = gemv_tile_valid_q &&
         ((gemv_tile_dest_q == 4'd0) || (gemv_tile_dest_q == 4'd1) ||
          (gemv_tile_dest_q == 4'd2) || (gemv_tile_dest_q == 4'd9));
-    assign gemv_store_ack_w = gemv_store_ack_imm | r2_store_ack |
-                              g7g_store_ack | g7u_store_ack | r6_store_ack;
+    assign gemv_store_ack_w = gemv_store_ack_imm |
+        (r2_store_ack  && (gemv_tile_dest_w == 4'd3)) |
+        (g7g_store_ack && (gemv_tile_dest_w == 4'd4)) |
+        (g7u_store_ack && (gemv_tile_dest_w == 4'd5)) |
+        (r6_store_ack  && (gemv_tile_dest_w == 4'd6));
 
     localparam int SEAM_H = K_PAR;
 
@@ -3175,10 +3203,21 @@ module eagle4_drafter #(
         end
 
         wire [R1F_FULL_CW-1:0] r1f_rd_idx_b = act_addr_b_w[R1F_FULL_CW-1:0];
+        wire                   r1f_rd_low_b = (r1f_rd_idx_b < R1F_FULL_CW'(3072/K_PAR));
         wire [R1F_FULL_CW-1:0] r1f_rd_idx_b_hi = r1f_rd_idx_b - R1F_FULL_CW'(3072/K_PAR);
         wire [R1F_HALF_CW-1:0] r1f_rd_half_idx_b =
-            r1f_rd_low ? r1f_rd_idx_b[R1F_HALF_CW-1:0]
-                       : r1f_rd_idx_b_hi[R1F_HALF_CW-1:0];
+            r1f_rd_low_b ? r1f_rd_idx_b[R1F_HALF_CW-1:0]
+                         : r1f_rd_idx_b_hi[R1F_HALF_CW-1:0];
+        reg r1f_rd_low_b_d1;
+        reg r1f_rd_oor_b_d1;
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) begin
+                r1f_rd_low_b_d1 <= 1'b1; r1f_rd_oor_b_d1 <= 1'b0;
+            end else begin
+                r1f_rd_low_b_d1 <= r1f_rd_low_b;
+                r1f_rd_oor_b_d1 <= (r1f_rd_idx_b >= R1F_FULL_CW'(R1_FULL_H/K_PAR));
+            end
+        end
 
         wire signed [K_PAR*A_WIDTH-1:0] r1_e_rd;
         wire signed [K_PAR*A_WIDTH-1:0] r1_e_rd_b;
@@ -3188,7 +3227,7 @@ module eagle4_drafter #(
             .wr_valid(r1f_e_wr), .wr_chunk_idx('0), .wr_chunk(r1f_e_wr_chunk),
             .wr_clear(g1_start), .wr_count(), .full(seam_r1_e_full),
 
-            .rd_valid(r1f_rd_low), .rd_chunk_idx(r1f_rd_half_idx), .rd_chunk(r1_e_rd),
+            .rd_valid(1'b1), .rd_chunk_idx(r1f_rd_half_idx), .rd_chunk(r1_e_rd),
             .rd_chunk_idx_b(r1f_rd_half_idx_b), .rd_chunk_b(r1_e_rd_b)
         );
 
@@ -3199,7 +3238,7 @@ module eagle4_drafter #(
             .clk(ap_clk), .rst_n(ap_rst_n),
             .wr_valid(r1f_h_wr), .wr_chunk_idx('0), .wr_chunk(r1f_h_wr_chunk),
             .wr_clear(g1_start), .wr_count(), .full(seam_r1_h_full),
-            .rd_valid(!r1f_rd_low && (r1f_rd_idx < R1F_FULL_CW'(R1_FULL_H/K_PAR))),
+            .rd_valid(1'b1),
             .rd_chunk_idx(r1f_rd_half_idx), .rd_chunk(r1_h_rd),
             .rd_chunk_idx_b(r1f_rd_half_idx_b), .rd_chunk_b(r1_h_rd_b)
         );
@@ -3207,8 +3246,8 @@ module eagle4_drafter #(
         assign seam_r1_rd = r1f_rd_oor_d1 ? '0
                           : r1f_rd_low_d1 ? r1_e_rd : r1_h_rd;
 
-        assign seam_r1_rd_b = r1f_rd_oor_d1 ? '0
-                            : r1f_rd_low_d1 ? r1_e_rd_b : r1_h_rd_b;
+        assign seam_r1_rd_b = r1f_rd_oor_b_d1 ? '0
+                            : r1f_rd_low_b_d1 ? r1_e_rd_b : r1_h_rd_b;
 
         assign seam_r1_full = seam_r1_e_full & seam_r1_h_full;
     end else begin : g_seam_r1_pilot

@@ -39,7 +39,7 @@ Replace `stage_sel`-derived GEMV configuration with ISA-programmable operation r
 
 For `y = A x`, let `A` have `m` output rows and `n` input columns. Let `G` be the number of consecutive input elements sharing a quantization scale within one output row.
 
-The fields below are proposed programmable configuration, not a list of registers that all exist today. Weights and scales remain resident in on-chip banks; this plan does not introduce compute-time weight streaming.
+The fields below are the implemented configuration (actual `special_regs` bank, latched by `gemv_shared_ctrl` at START). Weights and scales remain resident in on-chip banks; there is no compute-time weight streaming or descriptor bypass.
 
 ## Required operation configuration
 
@@ -53,7 +53,7 @@ All fields are shared by the lanes. Software does not configure each lane separa
 | `scale_base` | Starting address of `A`'s scale region in each lane's scale memory; units: 16-bit scale entries. |
 | `tile_count` | Number of output tiles: `m / 128` for aligned dimensions. |
 | `chunks_per_tile` | Input chunks processed per lane: `n / 16`. |
-| `chunks_per_scale_group` | Chunks sharing one scale: `G / 16`, currently 8. |
+| `chunks_per_scale_group` | Chunks sharing one scale: `G / 16`. Runtime value; supported set {4, 8}. |
 | `output_destination` | Selects the downstream buffer receiving results. |
 | `output_base` | Placement of the first output tile within that destination. |
 
@@ -88,13 +88,13 @@ Explicit weight/scale stride registers are needed only if padded or non-contiguo
 
 ## Numeric configuration
 
-Make these settings programmable only if operations need different numeric formats. They may remain fixed when all supported operations use the existing formats.
+These fields are validated fixed settings, not a general numeric-format menu. Unsupported values are rejected before any lane starts.
 
-| Register | Current setting / purpose |
+| Register | Implemented setting / contract |
 |---|---|
-| `qzero_raw` | Currently 1; decoded integer weight is `raw_code - (qzero_raw + 1)`. |
-| `scale_frac_bits` | Currently 13; fractional bits removed after scaled accumulation. |
-| `output_conversion` | Selects the required shift/round/saturation behavior when storing results into downstream activation buffers. |
+| `qzero_raw` | Fixed 1; decoded integer weight is `raw_code - (qzero_raw + 1)` (range -2..1). Other values rejected. |
+| `scale_frac_bits` | Fixed 13; Q3.13 scale, fractional bits removed after scaled accumulation. Other values rejected. |
+| `output_conversion` | Fixed 0: the destination's established serializer/conversion is used (Q/K/V 32-bit store; R2/R6 16-bit; R4 18-bit q6.12). Other values rejected; this is not a programmable format selector. |
 
 A programmable `qzero_raw` still supplies one zero-point per operation, not arbitrary per-group zero-points. The shared array remains a packed 2-bit-weight, INT16-activation engine; these fields do not make it a general FP16/FP32 GEMV.
 
@@ -143,7 +143,7 @@ n divisible by G
 
 Supporting other dimensions requires explicit padding or tail handling. In particular, a partial final scale group needs a final-group flush; changing counter bounds alone is insufficient.
 
-`chunks_per_scale_group` is currently a compile-time quantity, and the lane uses shifts/bit tests assuming a power-of-two group length. Making it programmable requires changing or constraining the group-index and group-boundary logic, not merely adding a register.
+`chunks_per_scale_group` is runtime and genuinely supports 4 and 8: the lane latches the value at start and derives group index, group-end/flush and scale-tag timing from its mask/shift, with group-index widths sized for the worst case (4). Unsupported lengths are rejected by the controller before launch. The destination store handshake holds DONE until the final serializer write.
 
 Runtime dimensions remain bounded by the elaborated counter widths and physical buffer/bank capacities. Memory-read lookahead and matched activation, weight, scale, and valid pipelines must remain aligned when the stage-derived configuration is replaced.
 

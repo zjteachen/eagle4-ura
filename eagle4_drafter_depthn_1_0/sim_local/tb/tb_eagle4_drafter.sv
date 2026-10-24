@@ -83,6 +83,8 @@ module tb_eagle4_drafter #(
     logic [16:0] boot_wr_addr;
     logic [31:0] boot_wr_data;
 
+    logic signed [16*16-1:0] tb_a_chunk;
+
     logic        tb_sc_we;
     logic [15:0] tb_sc_lane_sel;
     logic [16:0] tb_sc_wr_addr;
@@ -157,7 +159,7 @@ module tb_eagle4_drafter #(
         .m_axi_out_wdata(out_wdata), .m_axi_out_wstrb(out_wstrb), .m_axi_out_wlast(out_wlast), .m_axi_out_wvalid(out_wvalid), .m_axi_out_wready(out_wready),
         .m_axi_out_bid(out_bid), .m_axi_out_bresp(out_bresp), .m_axi_out_bvalid(out_bvalid), .m_axi_out_bready(out_bready),
 
-        .a_chunk('0),
+        .a_chunk(tb_a_chunk),
 
         .stage_sel(dbg_stage_sel),
         .array_chunk_idx_out(dbg_array_chunk_idx),
@@ -704,6 +706,7 @@ module tb_eagle4_drafter #(
             0: raw = (13*lane + 7*k + 11*(k/16)) & 3;
             1: raw = (13*lane + 7*k + 11*(k/16) + 17*tile) & 3;
             2: raw = (5*lane + 3*k + 7*(k/16) + 9) & 3;
+            3: raw = (13*lane + 5*k + 3*(k/16) + 7*(k/64)) & 3;
             default: raw = 0;
         endcase
         return raw - 2;
@@ -711,7 +714,31 @@ module tb_eagle4_drafter #(
 
     function automatic int signed gemv_x(input int mode, input int k);
         if (mode == 2) return ((5*k + 2) % 13) - 6;
+        if (mode == 3) return ((3*(k % 16) + 1) % 11) - 5;  // external chunk
         return ((7*k + 3) % 17) - 8;
+    endfunction
+
+    function automatic int signed gemv_scale_g(input int lane, input int g);
+        return 4096 + (37*lane + 53*g) % 2000;
+    endfunction
+
+    // Highest-group-index boundary regression: 512 chunks / cpg4 = 128
+    // groups (group index 0..127), all scales distinct per lane/group.
+    function automatic int signed gemv_oracle_m3(input int lane);
+        longint total, gsum;
+        int g, q, i, k;
+        total = 0;
+        for (g = 0; g < 128; g = g + 1) begin
+            gsum = 0;
+            for (q = 0; q < 4; q = q + 1)
+                for (i = 0; i < 16; i = i + 1) begin
+                    k = (4*g + q)*16 + i;
+                    gsum = gsum + longint'(gemv_x(3, k)) *
+                                   longint'(gemv_wg(3, lane, 0, k));
+                end
+            total = total + gsum * longint'(gemv_scale_g(lane, g));
+        end
+        return gemv_sat32(total);
     endfunction
 
     function automatic int signed gemv_sat32(input longint v);
@@ -867,13 +894,20 @@ module tb_eagle4_drafter #(
             $fatal(1, "GEMV: expected HALT at PC=%0d, got %08x", halt_pc, rd);
     endtask
 
+    bit tree_watch = 1'b0;
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && tree_watch && dut.tt_busy && !dut.gemv_busy_w)
+            $fatal(1, "GEMV TREE: BUSY dropped while the tiler/stream is active");
+    end
+
     bit gv_watch = 1'b0;
     int gv_starts = 0, gv_tiles = 0, gv_errors = 0;
     always @(posedge ap_clk) begin
         if (ap_rst_n && gv_watch) begin
             if (dut.gemv_array_start_w) gv_starts <= gv_starts + 1;
             if (dut.gemv_tile_valid_w)  gv_tiles  <= gv_tiles + 1;
-            if (dut.gemv_op_error_w)    gv_errors <= gv_errors + 1;
+            if (dut.gemv_op_error_w)     gv_errors <= gv_errors + 1;
+            if (dut.gemv_client_error_w) gv_errors <= gv_errors + 1;
         end
     end
 
@@ -1037,6 +1071,96 @@ module tb_eagle4_drafter #(
                 $fatal(1, "GEMV D: lane %0d K mismatch", lane);
         end
         $display("[%0t] PASS GEMV D: EMB source -> K destination, output_base=3", $time);
+
+        // ---------------- Test F: cpt512 / cpg4 -> 128 groups --------------
+        gv_reset();
+        gv_config(0, 1024, 1, 512, 4, 0, 256, 0, 0, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        for (int i = 0; i < 16; i = i + 1)
+            tb_a_chunk[i*16 +: 16] = 16'(gemv_x(3, i));
+        gv_load_weights(3, 0, 1024, 0, 512);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            for (int g = 0; g < 128; g = g + 1)
+                gv_load_scale(256 + g, lane, gemv_scale_g(lane, g));
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV F: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV F: starts=%0d tiles=%0d errors=%0d", gv_starts, gv_tiles, gv_errors);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            if ($signed(dut.q_full_buf[0][lane*32 +: 32]) !== 32'(gemv_oracle_m3(lane)))
+                $fatal(1, "GEMV F: lane %0d cpg4/512 mismatch actual=%0d exp=%0d",
+                       lane, $signed(dut.q_full_buf[0][lane*32 +: 32]), gemv_oracle_m3(lane));
+        end
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            logic [31:0] prd;
+            axil_write(0'hac, lane[9:0]);
+            axil_read(0'hb0, prd);
+            if ($signed(prd) !== 32'(gemv_oracle_m3(lane)))
+                $fatal(1, "GEMV F probe: lane %0d mismatch", lane);
+        end
+        $display("[%0t] PASS GEMV F: cpt=512 cpg=4 crosses all 128 groups, all 128 lanes + probe match", $time);
+        tb_a_chunk = '0;
+
+        // ---------------- Test G: directed valid short TREE -----------------
+        // ISA tile_count=4, legacy n_tiles_cfg=2: the tiler must receive the
+        // accepted session count (2), not the stale legacy value, and status
+        // must stay BUSY until the whole stream drains and then latch DONE.
+        gv_reset();
+        gv_config(0, 2048, 4, 16, 8, 0, 512, 0, 7, 13);
+        gv_byte(8'h0b); gv_byte(8'h40);
+        for (int i = 0; i < 16; i = i + 1)
+            tb_a_chunk[i*16 +: 16] = 16'sd1;
+        axil_write('h14c, 2);
+        gv_load_weights(0, 0, 2048, 0, 16);
+        gv_load_weights(0, 1, 2048, 0, 16);
+        gv_load_weights(0, 2, 2048, 0, 16);
+        gv_load_weights(0, 3, 2048, 0, 16);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            for (int t = 0; t < 4; t = t + 1)
+                for (int g = 0; g < 2; g = g + 1)
+                    gv_load_scale(512 + t*2 + g, lane, 8192 + (31*lane + 17*t + g) % 900);
+        tb_sc_we = 1'b0;
+        gv_begin_run(st);
+        tree_watch = 1'b1;
+        gv_wait_op(st);
+        tree_watch = 1'b0;
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV G: valid TREE bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (gv_starts != 2 || gv_tiles != 2 || gv_errors != 0)
+            $fatal(1, "GEMV G: expected 2 tiles from accepted ncfg, got starts=%0d tiles=%0d err=%0d",
+                   gv_starts, gv_tiles, gv_errors);
+        $display("[%0t] PASS GEMV G: valid TREE uses accepted session count (2 of ISA tile_count=4), BUSY held through drain", $time);
+
+        // ---------------- Test H: invalid TREE scan length + restart --------
+        axil_write('h14c, 5);       // > ISA tile_count=4 => reject before launch
+        gv_begin_run(st);
+        tree_watch = 1'b1;
+        gv_wait_op(st);
+        tree_watch = 1'b0;
+        if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
+            $fatal(1, "GEMV H: invalid TREE launched (starts=%0d tiles=%0d err=%0d)",
+                   gv_starts, gv_tiles, gv_errors);
+        if (!st[2] || st[1] || st[0])
+            $fatal(1, "GEMV H: bad status %08x (want ERROR only)", st);
+        gv_check_pc(gv_nb - 1);
+        axil_write('h14c, 1);       // restart with valid count
+        gv_begin_run(st);
+        tree_watch = 1'b1;
+        gv_wait_op(st);
+        tree_watch = 1'b0;
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV H restart: bad status %08x", st);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV H restart: starts=%0d tiles=%0d err=%0d",
+                   gv_starts, gv_tiles, gv_errors);
+        $display("[%0t] PASS GEMV H: invalid TREE count rejected without lane start; restart with accepted count completes", $time);
+        tb_a_chunk = '0;
 
         // ---------------- Test E: invalid configs terminate without launch -
         // E1: unsupported chunks_per_scale_group=2.

@@ -54,6 +54,7 @@ module gemv_shared_ctrl #(
     input  wire [1:0]  cfg_qzero_raw,
     input  wire [4:0]  cfg_scale_frac,
     input  wire [15:0] cfg_output_conversion,
+    input  wire [3:0]  weight_base_align,   // per-arm word/row alignment
 
     // ---- activation-source readiness (first tile of an operation) ----
     // source 3 R1, 4 pre-MLP/R2, 5 R5, 7 attention; others always ready.
@@ -81,9 +82,12 @@ module gemv_shared_ctrl #(
     input  wire        client_session_start,  // tree_start: latch config
     input  wire        client_active,         // tiler owns the engine this walk
     input  wire        client_start,          // tt_gemv_start: one tile
+    input  wire [15:0] client_n_tiles_cfg,    // legacy scan-length selector
+    input  wire        client_session_done,   // tree_done: walk + stream drained
     input  wire [15:0] client_tile_idx,
     output logic       client_error,          // pulse: request/config rejected
     output logic       client_config_ok,      // combinational: TREE config valid
+    output logic [15:0] client_scan_tiles,    // accepted scan length for tiler
 
     // ---- status/config exposure ----
     output logic        busy,
@@ -158,6 +162,8 @@ module gemv_shared_ctrl #(
     logic [15:0] rows_v;
     logic [31:0] w_span, s_span, o_span, a_span;
     logic        common_ok, isa_cfg_ok, client_cfg_ok;
+    wire [15:0]  client_n_eff =
+        (client_n_tiles_cfg == 16'd0) ? cfg_tile_count : client_n_tiles_cfg;
 
     always_comb begin
         rows_v = (cfg_chunks_per_scale_group == 16'd4) ? (cfg_chunks_per_tile >> 2)
@@ -178,6 +184,8 @@ module gemv_shared_ctrl #(
             (cfg_qzero_raw == 2'b01) &&
             (cfg_scale_frac == 5'd13) &&
             (cfg_output_conversion == 16'd0) &&
+            ((cfg_weight_base % 17'(weight_base_align)) == 17'd0) &&
+            ((cfg_chunks_per_tile % weight_base_align) == 16'd0) &&
             (w_span <= 32'(WEIGHT_DEPTH)) &&
             (s_span <= 32'(SCALE_DEPTH)) &&
             ((cfg_activation_source != 3'd0) ||
@@ -189,9 +197,12 @@ module gemv_shared_ctrl #(
                      dest_is_isa(cfg_output_destination) &&
                      (o_span <= 32'(dest_tiles(cfg_output_destination)));
 
+        // TREE scan length is a selector WITHIN the ISA-configured operation:
+        // 0 means the full configured span; any explicit count must fit it.
         client_cfg_ok = common_ok &&
                         (cfg_output_destination == 4'd7) &&
-                        (cfg_output_base == 16'd0);
+                        (cfg_output_base == 16'd0) &&
+                        (client_n_eff <= cfg_tile_count);
     end
 
     assign client_config_ok = client_cfg_ok;
@@ -214,9 +225,11 @@ module gemv_shared_ctrl #(
     logic [16:0] wbase0_q, sbase0_q, wbase_t_q, sbase_t_q;
     logic [3:0]  dest_q;
     logic        client_valid_q;
+    logic        client_session_q;
 
-    assign busy         = (state != S_IDLE);
+    assign busy         = (state != S_IDLE) || client_session_q;
     assign active_tile  = tile_q;
+    assign client_scan_tiles = client_n_eff;
     assign tile_dest    = dest_q;
     assign store_idx    = store_idx_q;
     assign arr_weight_base = wbase_t_q;
@@ -242,6 +255,7 @@ module gemv_shared_ctrl #(
             sbase_t_q        <= '0;
             dest_q           <= '0;
             client_valid_q   <= 1'b0;
+            client_session_q <= 1'b0;
             done_sticky      <= 1'b0;
             error_sticky     <= 1'b0;
             op_start         <= 1'b0;
@@ -274,6 +288,7 @@ module gemv_shared_ctrl #(
                         // A new operation clears the sticky status.
                         done_sticky  <= 1'b0;
                         error_sticky <= 1'b0;
+                        client_session_q <= 1'b0;
 
                         // Latch the actual bank outputs at START.
                         tiles_q  <= cfg_tile_count;
@@ -316,7 +331,9 @@ module gemv_shared_ctrl #(
                         end
                     end else if (client_session_start) begin
                         // TREE session: latch the same configuration fields.
-                        error_sticky <= 1'b0;
+                        done_sticky   <= 1'b0;
+                        error_sticky  <= 1'b0;
+                        client_session_q <= 1'b0;
                         tiles_q  <= cfg_tile_count;
                         cpt_q    <= cfg_chunks_per_tile;
                         cpg_q    <= cfg_chunks_per_scale_group;
@@ -333,6 +350,7 @@ module gemv_shared_ctrl #(
                         latched_tile_count        <= cfg_tile_count;
                         latched_valid             <= client_cfg_ok;
                         client_valid_q            <= client_cfg_ok;
+                        client_session_q          <= client_cfg_ok;
                         isa_mode_q                <= 1'b0;
                         if (!client_cfg_ok) begin
                             error_sticky <= 1'b1;
@@ -354,9 +372,17 @@ module gemv_shared_ctrl #(
                         end else begin
                             // Real backpressure: never launch outside the
                             // validated config or while another tile is active.
-                            error_sticky <= 1'b1;
-                            client_error <= 1'b1;
+                            error_sticky     <= 1'b1;
+                            client_error     <= 1'b1;
+                            client_session_q <= 1'b0;
+                            client_valid_q   <= 1'b0;
                         end
+                    end else if (client_session_done && client_session_q) begin
+                        // Explicit session completion: the TREE walk includes
+                        // its streaming drain; DONE becomes sticky only here.
+                        client_session_q <= 1'b0;
+                        client_valid_q   <= 1'b0;
+                        done_sticky      <= 1'b1;
                     end
                 end
                 // ------------------------------------------------------
