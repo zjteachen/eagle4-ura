@@ -8,6 +8,9 @@
 #                              #   isolated RMSNorm execution (no weights)
 #   ./run_sim.sh regs         # ISA WRSR -> special_regs bank / AXI readback
 #                              #   test (no weight/activation loads)
+#   ./run_sim.sh gemv         # bounded real shared-GEMV cutover: HFC/EMB ->
+#                              #   QKV/Q/K destinations, runtime groups 4/8,
+#                              #   nonzero bases, invalid-config/restart
 #   ./run_sim.sh              # full depth: real WEIGHT/SCALE bank sizes
 #                              #   (~14.7M direct-drive pokes -- slow, but
 #                              #   the true load, matching real hardware)
@@ -32,6 +35,8 @@ elif [[ "${1:-}" == "g1" ]]; then
     SIM_ARGS=(+G1_ONLY)
 elif [[ "${1:-}" == "regs" ]]; then
     SIM_ARGS=(+REGS_ONLY)
+elif [[ "${1:-}" == "gemv" ]]; then
+    SIM_ARGS=(+GEMV_ONLY)
 fi
 
 verilator --binary --timing -Wno-fatal \

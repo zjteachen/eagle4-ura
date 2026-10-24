@@ -157,7 +157,12 @@ module tb_eagle4_drafter #(
         .m_axi_out_wdata(out_wdata), .m_axi_out_wstrb(out_wstrb), .m_axi_out_wlast(out_wlast), .m_axi_out_wvalid(out_wvalid), .m_axi_out_wready(out_wready),
         .m_axi_out_bid(out_bid), .m_axi_out_bresp(out_bresp), .m_axi_out_bvalid(out_bvalid), .m_axi_out_bready(out_bready),
 
-        .a_chunk('0), .qz_raw('0), .tile_idx('0),
+        .a_chunk('0),
+
+        .stage_sel(dbg_stage_sel),
+        .array_chunk_idx_out(dbg_array_chunk_idx),
+        .array_chunk_idx_valid(dbg_array_chunk_idx_valid),
+        .array_acc_out(dbg_array_acc),
 
         .m_axi_g8_arid(m_axi_g8_arid_u), .m_axi_g8_araddr(m_axi_g8_araddr_u), .m_axi_g8_arlen(m_axi_g8_arlen_u),
         .m_axi_g8_arsize(m_axi_g8_arsize_u), .m_axi_g8_arburst(m_axi_g8_arburst_u), .m_axi_g8_arvalid(m_axi_g8_arvalid_u),
@@ -179,9 +184,12 @@ module tb_eagle4_drafter #(
         .m_axi_embb_arready(1'b0), .m_axi_embb_rid('0), .m_axi_embb_rdata('0), .m_axi_embb_rresp('0), .m_axi_embb_rlast(1'b0), .m_axi_embb_rvalid(1'b0),
         .m_axi_embb_rready(m_axi_embb_rready_u)
 
-        // stage_sel / array_chunk_idx_out / array_chunk_idx_valid / array_acc_out
-        // are debug-probe outputs — left unconnected, harmless.
     );
+
+    wire [3:0]  dbg_stage_sel;
+    wire [15:0] dbg_array_chunk_idx;
+    wire        dbg_array_chunk_idx_valid;
+    wire signed [32*128-1:0] dbg_array_acc;
 
     // ================================================================
     // Fake "HBM" behind the output write-DMA
@@ -311,10 +319,10 @@ module tb_eagle4_drafter #(
 
     always @(posedge ap_clk) begin
         if (ap_rst_n && sr_test_active) begin
-            if (dut.g1_start || dut.g4_start || dut.g5_start || dut.g6_start ||
+            if (dut.g1_start || dut.gemv_op_start_w || dut.g5_start || dut.g6_start ||
                 dut.g7g_start || dut.g7u_start || dut.g7p_start ||
                 dut.g9_start || dut.g11_start || dut.glm_start ||
-                dut.g12_start || dut.tree_start || dut.g8_start)
+                dut.tree_start || dut.g8_start)
                 $fatal(1, "REGS-only: a stage started");
             if (out_awvalid || out_wvalid || m_axi_boot_arvalid_u ||
                 m_axi_g8_arvalid_u || m_axi_g8b_arvalid_u ||
@@ -625,10 +633,10 @@ module tb_eagle4_drafter #(
 
     always @(posedge ap_clk) begin
         if (ap_rst_n && g1_test_active) begin
-            if (dut.g4_start || dut.g5_start || dut.g6_start ||
+            if (dut.gemv_op_start_w || dut.g5_start || dut.g6_start ||
                 dut.g7g_start || dut.g7u_start || dut.g7p_start ||
                 dut.g9_start || dut.g11_start || dut.glm_start ||
-                dut.g12_start || dut.tree_start || dut.g8_start)
+                dut.tree_start || dut.g8_start)
                 $fatal(1, "G1-only: a downstream stage started");
             if (out_awvalid || out_wvalid || m_axi_boot_arvalid_u ||
                 m_axi_g8_arvalid_u || m_axi_g8b_arvalid_u ||
@@ -668,7 +676,413 @@ module tb_eagle4_drafter #(
             repeat (200_000) @(posedge ap_clk);
             $fatal(1, "REGS-only: global watchdog expired");
         end
+        if ($test$plusargs("GEMV_ONLY")) begin
+            repeat (2_000_000) @(posedge ap_clk);
+            $fatal(1, "GEMV-only: global watchdog expired");
+        end
     end
+
+
+    // ================================================================
+    // Bounded real GEMV cutover test (real top, AXI PMEM, real banks).
+    //
+    // Fixture is generated here and checked against an independent integer
+    // oracle (no forced DUT outputs):
+    //   x[k]      = ((7*k+3) % 17) - 8                 [HFC mode]
+    //   x_emb[k]  = ((5*k+2) % 13) - 6                 [EMB mode]
+    //   raw[l,k]  = (13*l + 7*k + 11*(k/16)) & 3
+    //   w[l,k]    = raw[l,k] - 2
+    //   raw48     = sum_g (sum_{k in g} x[k]*w[l,k]) * scale_g
+    //   y[l]      = sat32((raw48 + 4096) >>> 13)
+    // Scale-groups use DISTINCT per-group scales so a wrong runtime group
+    // index cannot be masked by identical scales.
+    // ================================================================
+    function automatic int signed gemv_wg(input int mode, input int lane,
+                                          input int tile, input int k);
+        int raw;
+        case (mode)
+            0: raw = (13*lane + 7*k + 11*(k/16)) & 3;
+            1: raw = (13*lane + 7*k + 11*(k/16) + 17*tile) & 3;
+            2: raw = (5*lane + 3*k + 7*(k/16) + 9) & 3;
+            default: raw = 0;
+        endcase
+        return raw - 2;
+    endfunction
+
+    function automatic int signed gemv_x(input int mode, input int k);
+        if (mode == 2) return ((5*k + 2) % 13) - 6;
+        return ((7*k + 3) % 17) - 8;
+    endfunction
+
+    function automatic int signed gemv_sat32(input longint v);
+        longint r;
+        r = (v + 64'sd4096) >>> 13;
+        if (r > 64'sd2147483647)  return 32'sd2147483647;
+        if (r < -64'sd2147483648) return -32'sd2147483648;
+        return int'(r);
+    endfunction
+
+    function automatic int signed gemv_oracle(
+        input int mode, input int lane, input int tile,
+        input int act_base, input int cpt, input int cpg,
+        input int scale0, input int scale1
+    );
+        int q, i, k, g;
+        longint sum0, sum1, raw48;
+        sum0 = 0; sum1 = 0;
+        for (q = 0; q < cpt; q = q + 1) begin
+            g = (cpg == 4) ? (q >> 2) : 0;
+            for (i = 0; i < 16; i = i + 1) begin
+                k = (act_base + q)*16 + i;
+                if (g == 0)
+                    sum0 = sum0 + longint'(gemv_x(mode, k)) * longint'(gemv_wg(mode, lane, tile, k));
+                else
+                    sum1 = sum1 + longint'(gemv_x(mode, k)) * longint'(gemv_wg(mode, lane, tile, k));
+            end
+        end
+        raw48 = sum0 * longint'(scale0);
+        if (cpg == 4) raw48 = raw48 + sum1 * longint'(scale1);
+        return gemv_sat32(raw48);
+    endfunction
+
+    function automatic int signed gemv_scale0(input int lane);
+        return 8192 + (37*lane) % 1000;
+    endfunction
+    function automatic int signed gemv_scale1(input int lane);
+        // Always DISTINCT from scale0 for the same lane and group.
+        return 8192 + (37*lane) % 1000 + 257 + 13*(lane % 7);
+    endfunction
+
+    // ---- tiny PMEM program assembler (byte oriented) ----
+    int gv_nb;
+    logic [7:0] gv_prog [0:127];
+
+    task automatic gv_reset();
+        gv_nb = 0;
+    endtask
+    task automatic gv_byte(input logic [7:0] b);
+        gv_prog[gv_nb] = b;
+        gv_nb = gv_nb + 1;
+    endtask
+    task automatic gv_wrsr(input int r, input int v);
+        gv_byte(8'h60 | 8'(r));
+        gv_byte(8'(v[7:0]));
+        gv_byte(8'(v[15:8]));
+    endtask
+    task automatic gv_config(
+        input int act_base, input int wbase, input int tiles, input int cpt,
+        input int cpg, input int obase, input int sbase, input int src,
+        input int dest, input int frac
+    );
+        gv_wrsr(0, act_base);  gv_wrsr(1, wbase & 16'hffff);
+        gv_wrsr(2, tiles);     gv_wrsr(3, cpt);
+        gv_wrsr(4, cpg);       gv_wrsr(5, obase);
+        gv_wrsr(6, (wbase >> 16) & 1);
+        gv_wrsr(7, sbase & 16'hffff); gv_wrsr(8, (sbase >> 16) & 1);
+        gv_wrsr(9, (src << 11) | (dest << 7) | (1 << 5) | (frac & 31));
+        gv_wrsr(10, 0);
+    endtask
+
+    task automatic gv_upload(output logic [31:0] status);
+        logic [31:0] w, rd;
+        int nw, b, j, n;
+        axil_write(ADDR_PMEM_ADDR, 0);
+        nw = (gv_nb + 3) / 4;
+        for (b = 0; b < nw*4; b = b + 4) begin
+            w = 32'h4040_4040;
+            for (j = 0; j < 4; j = j + 1)
+                if (b + j < gv_nb) w[j*8 +: 8] = gv_prog[b + j];
+            axil_write(ADDR_PMEM_DATA, w);
+        end
+        rd = 0;
+        for (n = 0; n < 20 && rd != nw; n = n + 1)
+            axil_read(ADDR_PMEM_ADDR, rd);
+        if (rd != nw) $fatal(1, "GEMV: PMEM upload committed %0d/%0d words", rd, nw);
+        axil_read(ADDR_PMEM_DATA, status);
+    endtask
+
+    task automatic gv_load_weights(
+        input int mode, input int tile, input int wbase,
+        input int act_base, input int cpt
+    );
+        int lane, q, i, raw, waddr;
+        logic [31:0] w;
+        boot_we = 1'b1;
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            boot_lane_sel = lane[15:0];
+            for (q = 0; q < cpt; q = q + 1) begin
+                w = 32'd0;
+                for (i = 0; i < 16; i = i + 1) begin
+                    raw = gemv_wg(mode, lane, tile, (act_base + q)*16 + i) + 2;
+                    w[i*2 +: 2] = 2'(raw);
+                end
+                waddr = wbase + tile*cpt + q;
+                boot_wr_addr = waddr[16:0];
+                boot_wr_data = w;
+                @(posedge ap_clk);
+            end
+        end
+        boot_we = 1'b0;
+        @(posedge ap_clk);
+    endtask
+
+    task automatic gv_load_scale(input int addr, input int lane, input int value);
+        tb_sc_we = 1'b1;
+        tb_sc_lane_sel = lane[15:0];
+        tb_sc_wr_addr = addr[16:0];
+        tb_sc_wr_data = 16'(value);
+        @(posedge ap_clk);
+    endtask
+
+    task automatic gv_load_vector(input bit use_emb, input int mode, input int nchunks);
+        logic signed [15:0] lo, hi;
+        for (int ch = 0; ch < nchunks; ch = ch + 1) begin
+            axil_write(ADDR_BOOT_WR_ADDR, ch*8);
+            for (int w = 0; w < 8; w = w + 1) begin
+                lo = 16'(gemv_x(mode, ch*16 + 2*w));
+                hi = 16'(gemv_x(mode, ch*16 + 2*w + 1));
+                axil_write(ADDR_BOOT_WR_DATA, {hi, lo});
+            end
+        end
+    endtask
+
+    task automatic gv_wait_op(output logic [31:0] status);
+        logic [31:0] ap;
+        int n;
+        axil_write(ADDR_AP_CTRL, 1);
+        // The ISA PC blocks on GEMV until DONE or validated ERROR, so waiting
+        // for ap_done first also removes the stale-sticky-status race from
+        // polling 0x170 while the new program is still executing WRSRs.
+        ap = 0;
+        for (n = 0; n < 40000 && !ap[1]; n = n + 1)
+            axil_read(ADDR_AP_CTRL, ap);
+        if (!ap[1]) $fatal(1, "GEMV: timeout waiting for ap_done");
+        axil_read(ADDR_GEMV_STATUS, status);
+    endtask
+
+    task automatic gv_check_pc(input int halt_pc);
+        logic [31:0] rd;
+        axil_read(ADDR_PMEM_DATA, rd);
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'(halt_pc) || rd[7:0] !== 8'h40)
+            $fatal(1, "GEMV: expected HALT at PC=%0d, got %08x", halt_pc, rd);
+    endtask
+
+    bit gv_watch = 1'b0;
+    int gv_starts = 0, gv_tiles = 0, gv_errors = 0;
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && gv_watch) begin
+            if (dut.gemv_array_start_w) gv_starts <= gv_starts + 1;
+            if (dut.gemv_tile_valid_w)  gv_tiles  <= gv_tiles + 1;
+            if (dut.gemv_op_error_w)    gv_errors <= gv_errors + 1;
+        end
+    end
+
+    task automatic gv_begin_run(output logic [31:0] status);
+        gv_watch = 1'b0;
+        gv_starts = 0; gv_tiles = 0; gv_errors = 0;
+        gv_upload(status);
+        gv_watch = 1'b1;
+    endtask
+
+    task automatic run_gemv_only();
+        logic [31:0] st;
+        int lane;
+
+        $display("[%0t] ---- shared GEMV cutover test (real top, AXI PMEM) ----", $time);
+
+        // ---------------- Test A: HFC -> QKV composite, cpg=8 ----------------
+        gv_reset();
+        gv_config(0, 0, 1, 8, 8, 0, 0, 1, 9, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        axil_write(ADDR_HFC_SELECT, 1);
+        gv_load_vector(1'b0, 0, 10);
+        axil_write(ADDR_HFC_SELECT, 0);
+        gv_load_weights(0, 0, 0, 0, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            gv_load_scale(0, lane, gemv_scale0(lane));
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);           // probe stage view 0 (QKV/Q/K/V)
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0]) begin
+            logic [31:0] s2;
+            axil_read(ADDR_PMEM_DATA, s2);
+            $display("GEMV A diagnostic: status=%08x PMEM=%08x ctrl_state=%0d tile=%0d starts=%0d tiles=%0d err=%0d",
+                     st, s2, dut.u_gemv_ctrl.state, dut.u_gemv_ctrl.tile_q,
+                     gv_starts, gv_tiles, gv_errors);
+            $fatal(1, "GEMV A: bad status %08x (want DONE, no BUSY/ERROR)", st);
+        end
+        gv_check_pc(gv_nb - 1);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV A: starts=%0d tiles=%0d errors=%0d", gv_starts, gv_tiles, gv_errors);
+        // Per-lane scales differ, so re-check each lane's actual scale:
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            if ($signed(dut.q_full_buf[0][lane*32 +: 32]) !==
+                32'(gemv_oracle(0, lane, 0, 0, 8, 8, gemv_scale0(lane), 0)))
+                $fatal(1, "GEMV A: lane %0d Q mismatch", lane);
+        end
+        // Probe check with per-lane scales:
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            logic [31:0] prd;
+            axil_write(0'hac, lane[9:0]);
+            axil_read(0'hb0, prd);
+            if ($signed(prd) !==
+                32'(gemv_oracle(0, lane, 0, 0, 8, 8, gemv_scale0(lane), 0)))
+                $fatal(1, "GEMV A probe: lane %0d mismatch (%0d)", lane, $signed(prd));
+        end
+        $display("[%0t] PASS GEMV A: HFC -> QKV composite, cpg=8, one tile, %0d array starts",
+                 $time, gv_starts);
+
+        // ---------------- Test B: runtime cpg=4 (two distinct groups) ------
+        gv_reset();
+        gv_config(0, 0, 1, 8, 4, 0, 0, 1, 0, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        axil_write(ADDR_HFC_SELECT, 1);
+        gv_load_vector(1'b0, 0, 8);
+        axil_write(ADDR_HFC_SELECT, 0);
+        gv_load_weights(0, 0, 0, 0, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            gv_load_scale(0, lane, gemv_scale0(lane));
+            gv_load_scale(1, lane, gemv_scale1(lane));
+        end
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV B: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV B: starts=%0d tiles=%0d errors=%0d", gv_starts, gv_tiles, gv_errors);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            if ($signed(dut.q_full_buf[0][lane*32 +: 32]) !==
+                32'(gemv_oracle(0, lane, 0, 0, 8, 4, gemv_scale0(lane), gemv_scale1(lane))))
+                $fatal(1, "GEMV B: lane %0d cpg4 mismatch", lane);
+        end
+        $display("[%0t] PASS GEMV B: runtime cpg=4, all 128 lanes match 2-group oracle",
+                 $time);
+
+        // ---------------- Test C: nonzero act/w/scale/output bases, 2 tiles -
+        gv_reset();
+        gv_config(1, 16, 2, 8, 8, 2, 4, 1, 0, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        axil_write(ADDR_HFC_SELECT, 1);
+        gv_load_vector(1'b0, 0, 10);
+        axil_write(ADDR_HFC_SELECT, 0);
+        gv_load_weights(1, 0, 16, 1, 8);
+        gv_load_weights(1, 1, 16, 1, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            gv_load_scale(4, lane, 8000 + lane % 100);       // tile 0
+            gv_load_scale(5, lane, 9000 + lane % 100);       // tile 1
+        end
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV C: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            if ($signed(dut.q_full_buf[2][lane*32 +: 32]) !==
+                32'(gemv_oracle(1, lane, 0, 1, 8, 8, 8000 + lane % 100, 0)))
+                $fatal(1, "GEMV C: lane %0d tile0 mismatch", lane);
+            if ($signed(dut.q_full_buf[3][lane*32 +: 32]) !==
+                32'(gemv_oracle(1, lane, 1, 1, 8, 8, 9000 + lane % 100, 0)))
+                $fatal(1, "GEMV C: lane %0d tile1 mismatch", lane);
+        end
+        // The probe replays a 128-word tile over 128 cycles, so consecutive
+        // short tiles cannot both be snapshotted (documented probe depth
+        // limit). Destination buffers above cover BOTH tiles; the probe
+        // covers the first captured tile against the same oracle.
+        for (int i = 0; i < LANES; i = i + 1) begin
+            logic [31:0] prd;
+            axil_write(0'hac, i[9:0]);
+            axil_read(0'hb0, prd);
+            if ($signed(prd) !== 32'(gemv_oracle(1, i, 0, 1, 8, 8, 8000 + i % 100, 0)))
+                $fatal(1, "GEMV C probe: tile0 lane%0d mismatch", i);
+        end
+        axil_read(0'hbc, st);
+        if (st !== 32'd128)
+            $fatal(1, "GEMV C probe: expected the first tile's 128 words, got %0d", st);
+        axil_read(ADDR_GEMV_TILE, st);
+        if (st[15:0] !== 16'd1)
+            $fatal(1, "GEMV C: active tile expected 1, got %0d", st[15:0]);
+        if (gv_starts != 2 || gv_tiles != 2)
+            $fatal(1, "GEMV C: expected 2 starts/tiles, got %0d/%0d", gv_starts, gv_tiles);
+        $display("[%0t] PASS GEMV C: nonzero bases act=%0d w=%0d s=%0d out=%0d, 2 tiles, groups=8",
+                 $time, 1, 16, 4, 2);
+
+        // ---------------- Test D: EMB source -> K destination --------------
+        gv_reset();
+        gv_config(0, 64, 1, 8, 8, 3, 8, 2, 1, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        axil_write(ADDR_EMB_SELECT, 1);
+        gv_load_vector(1'b1, 2, 8);          // x_emb formula in EMB buffer
+        axil_write(ADDR_EMB_SELECT, 0);
+        gv_load_weights(2, 0, 64, 0, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            gv_load_scale(8, lane, 6000 + (53*lane) % 700);
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV D: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV D: starts=%0d tiles=%0d errors=%0d", gv_starts, gv_tiles, gv_errors);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            if ($signed(dut.k_full_buf[3][lane*32 +: 32]) !==
+                32'(gemv_oracle(2, lane, 0, 0, 8, 8, 6000 + (53*lane) % 700, 0)))
+                $fatal(1, "GEMV D: lane %0d K mismatch", lane);
+        end
+        $display("[%0t] PASS GEMV D: EMB source -> K destination, output_base=3", $time);
+
+        // ---------------- Test E: invalid configs terminate without launch -
+        // E1: unsupported chunks_per_scale_group=2.
+        gv_reset();
+        gv_config(0, 0, 1, 8, 2, 0, 0, 1, 0, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
+            $fatal(1, "GEMV E1: illegal config launched (starts=%0d tiles=%0d err=%0d)",
+                   gv_starts, gv_tiles, gv_errors);
+        if (!st[2] || st[1] || st[0])
+            $fatal(1, "GEMV E1: bad status %08x (want ERROR only)", st);
+        gv_check_pc(gv_nb - 1);
+        axil_read(ADDR_GEMV_TILE, st);
+        if (st[15:0] !== 16'd0) $fatal(1, "GEMV E1: active tile moved");
+
+        // E2: unsupported scale_frac=12.
+        gv_reset();
+        gv_config(0, 0, 1, 8, 8, 0, 0, 1, 0, 12);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
+            $fatal(1, "GEMV E2: illegal frac launched (starts=%0d tiles=%0d err=%0d)",
+                   gv_starts, gv_tiles, gv_errors);
+        if (!st[2] || st[1] || st[0])
+            $fatal(1, "GEMV E2: bad status %08x (want ERROR only)", st);
+
+        // E3: restart after errors clears sticky ERROR and runs again.
+        gv_reset();
+        gv_config(0, 0, 1, 8, 8, 0, 0, 1, 9, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        gv_wait_op(st);
+        if (!st[1] || st[2] || st[0])
+            $fatal(1, "GEMV E3 restart: bad status %08x (ERROR must clear at START)", st);
+        if (gv_starts != 1 || gv_errors != 0)
+            $fatal(1, "GEMV E3: restart starts=%0d errors=%0d", gv_starts, gv_errors);
+        gv_check_pc(gv_nb - 1);
+        $display("[%0t] PASS GEMV E: invalid cpg/frac terminate without launch; restart clears ERROR",
+                 $time);
+
+        $display("[%0t] PASS: shared GEMV cutover (A-D) and error/restart (E); real banks, AXI PMEM, all-lane oracle.",
+                 $time);
+    endtask
 
     task automatic run_g1_only();
         logic [31:0] rd;
@@ -771,6 +1185,12 @@ module tb_eagle4_drafter #(
             disable main_sequence;
         end
 
+        if ($test$plusargs("GEMV_ONLY")) begin
+            run_gemv_only();
+            $finish;
+            disable main_sequence;
+        end
+
         $display("[%0t] ---- loading WEIGHT banks (%0d lanes x %0d words) ----", $time, LANES, W_DEPTH);
         load_all_weight_banks();
 
@@ -803,22 +1223,50 @@ module tb_eagle4_drafter #(
         $display("  PMEM write_addr reset: got 0x%08x (expect 0x00000000)", rd);
         if (rd[7:0] !== 8'd0) errors++;
 
-        // Load the ISA program for the linear draft pass (13 bytes):
-        // bytes 0..11 = STATE G1,G4,G5,G6,G7G,G7U,G7_SILU,G9,G11,GLM,G12,TREE
-        // byte 12 = HALT. State IDs follow the top_fsm enum (G11=9, GLM=13).
-        // Word 0 (bytes 0..3):  G1,G4,G5,G6
-        // Word 1 (bytes 4..7):  G7G,G7U,G7_SILU,G9
-        // Word 2 (bytes 8..11): G11,GLM,G12,TREE
-        // Word 3 (byte 12):     HALT
-        axil_write(ADDR_PMEM_DATA, 32'h0403_0201);
-        axil_write(ADDR_PMEM_DATA, 32'h0807_0605);
-        axil_write(ADDR_PMEM_DATA, 32'h0B0A_0D09);
-        axil_write(ADDR_PMEM_DATA, 32'h0000_0040);
+        // Assemble the linear draft pass from WRSR + GEMV 0x80 + the
+        // remaining non-shared STATE instructions. The GEMV configurations
+        // are DELTA writes: only fields whose value differs from the prior
+        // operation are re-written. This is the real full-pipeline program:
+        //   STATE G1; GEMV(QKV src=R1 dst=QKV 72 tiles);
+        //   STATE G5; GEMV(R2 src=attention dst=R2);
+        //   GEMV(R4g src=preMLP dst=R4G); GEMV(R4u ... dst=R4U);
+        //   STATE G7_SILU; GEMV(R5 src=R5 dst=R6/residual);
+        //   STATE G11; STATE GLM; WRSR TREE config; STATE TREE; HALT.
+        gv_reset();
+        gv_byte(8'h01);                                   // STATE G1
+        gv_config(0, 0, 72, 384, 8, 0, 0, 3, 9, 13);      // QKV: R1 -> QKV
+        gv_byte(8'h80);                                   // GEMV
+        gv_byte(8'h03);                                   // STATE G5
+        gv_wrsr(1, 27648); gv_wrsr(2, 24); gv_wrsr(3, 192);
+        gv_wrsr(7, 3456);  gv_wrsr(9, 16'h39AD);          // src7 dest3
+        gv_byte(8'h80);
+        gv_wrsr(1, 32256); gv_wrsr(2, 64);
+        gv_wrsr(7, 4032);  gv_wrsr(9, 16'h222D);          // src4 dest4
+        gv_byte(8'h80);
+        gv_wrsr(1, 44544); gv_wrsr(7, 5568);
+        gv_wrsr(9, 16'h22AD);                             // src4 dest5
+        gv_byte(8'h80);
+        gv_byte(8'h07);                                   // STATE G7_SILU
+        gv_wrsr(1, 56832); gv_wrsr(2, 24); gv_wrsr(3, 512);
+        gv_wrsr(7, 7104);  gv_wrsr(9, 16'h2B2D);          // src5 dest6
+        gv_byte(8'h80);
+        gv_byte(8'h09);                                   // STATE G11
+        gv_byte(8'h0D);                                   // STATE GLM
+        gv_wrsr(1, 16'h3E00); gv_wrsr(6, 1);              // G12 weight base 81408
+        gv_wrsr(2, 1002); gv_wrsr(3, 16); gv_wrsr(7, 10176);
+        gv_wrsr(9, 16'h33AD);                             // src6 dest7 (TREE)
+        gv_byte(8'h0B);                                   // STATE TREE
+        gv_byte(8'h40);                                   // HALT
+        if (gv_nb > 128)
+            $fatal(1, "full pipeline program %0d bytes exceeds the 128-byte PMEM", gv_nb);
+        $display("  assembled full pipeline delta-WRSR program: %0d bytes (limit 128)", gv_nb);
+        gv_upload(rd);
 
-        // Verify write address pointer auto-incremented to 4
+        // Verify the write pointer committed exactly the assembled words.
         axil_read(ADDR_PMEM_ADDR, rd);
-        $display("  PMEM write_addr after 4 writes: got 0x%08x (expect 0x00000004)", rd);
-        if (rd[7:0] !== 8'd4) errors++;
+        $display("  PMEM write_addr after upload: got 0x%08x (expect %0d words)",
+                 rd, (gv_nb+3)/4);
+        if (rd[7:0] !== 8'((gv_nb+3)/4)) errors++;
 
         // 3. Verify fetcher initial state: PC=0, instr=0x01 (first byte of word 0)
         axil_read(ADDR_PMEM_DATA, rd);
@@ -921,10 +1369,10 @@ module tb_eagle4_drafter #(
         end
         // ---- Verify program ran to HALT: PC frozen at the HALT byte ----
         axil_read(ADDR_PMEM_DATA, rd);
-        $display("[%0t] PMEM status post-run: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect PC=12, instr=0x40 HALT)",
-                 $time, rd, rd[31:16], rd[14:8], rd[7:0]);
-        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'd12 || rd[7:0] !== 8'h40) begin
-            $display("  FAIL: program did not halt at byte 12!");
+        $display("[%0t] PMEM status post-run: got 0x%08x (canary=0x%04x, PC=%0d, instr=0x%02x; expect PC=%0d, instr=0x40 HALT)",
+                 $time, rd, rd[31:16], rd[14:8], rd[7:0], gv_nb-1);
+        if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'(gv_nb-1) || rd[7:0] !== 8'h40) begin
+            $display("  FAIL: program did not halt at byte %0d!", gv_nb-1);
             errors++;
         end else begin
             $display("  PASS: ISA program executed G1..TREE and halted with PC frozen at the HALT byte.");

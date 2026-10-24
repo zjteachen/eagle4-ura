@@ -41,6 +41,8 @@ package eagle4_regmap_pkg;
     // ---- ISA PMEM mailbox & status ----
     localparam int ADDR_PMEM_ADDR      = 'h168; // W write_addr pointer | R {24'b0, write_addr}
     localparam int ADDR_PMEM_DATA      = 'h16c; // W write_data (autoincs write_addr) | R {16'h504D, 1'b0, PC, instr}
+    localparam int ADDR_GEMV_STATUS    = 'h170; // R bit0 BUSY, bit1 sticky DONE, bit2 sticky ERROR
+    localparam int ADDR_GEMV_TILE      = 'h174; // R active/last engine tile
     localparam int ADDR_SR_SEL         = 'h178; // W/R special-reg read selector (5-bit)
     localparam int ADDR_SR_DATA        = 'h17c; // R {16'h5A5A, special_regs.read_data}
 
