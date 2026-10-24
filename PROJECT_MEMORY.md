@@ -72,3 +72,32 @@
     WRSR, reserved addresses, restart, JMP/HALT, reserved opcode, end-of-PMEM
     wrap, and a 22-write/23-cycle arbitration loop; existing `+G1_ONLY`
     re-passed to preserve STATE semantics.
+- **2026-10-24: shared GEMV cutover integrated and verified.**
+  - `gemv_shared_ctrl.sv` (new): sole owner of shared-engine sequencing.
+    ISA GEMV `0x80` / TREE session start latch the actual `special_regs`
+    outputs, validate numeric/geometry/routing spans in 32-bit arithmetic,
+    advance explicit weight/scale tile bases with a SETTLE cycle, launch one
+    tile, qualify result-valid, wait for the destination store ack, and
+    assert DONE only after the final store. Invalid config sets sticky ERROR
+    and terminates the ISA wait without launching a lane.
+  - `instruction_fetcher.sv`: GEMV `0x80` blocking opcode; `state_valid_mask`
+    retires G4/G6/G7G/G7U/G9/G12 STATE operands (decode as HALT). AXI
+    status `0x170` BUSY/sticky DONE/sticky ERROR and `0x174` active tile.
+  - Banks/array/lanes: explicit `cfg_base` replaces stage-derived weight/
+    scale bases; runtime chunks-per-tile and chunks-per-scale-group (4 or 8)
+    replace compile-time bounds; lane group tag/last-boundary use a latched
+    runtime mask/shift and widened group indices. The unscaled and K_PAR64
+    shared arms consume the same API with runtime lane counts; lmdown/G8 are
+    untouched.
+  - Top: activation sources 0..7 route real addresses/data into the existing
+    buffers; destinations 0..6/9 retain the destination serializers and all
+    attention/norm/residual start/done side effects. g4seq/bkseq and the old
+    shared STATE execution are removed. TREE is the sole G12 client of the
+    same config with stream backpressure; invalid TREE config is gated off
+    and terminates the ISA wait.
+  - Verification: `make sim MODE=gemv` (real top, real banks, AXI PMEM/HFC/
+    EMB, direct simulation-only weight/scale pins) checks all 128 destination
+    words and the probe against an independent integer oracle for cpg 4/8,
+    zero and nonzero bases, two tiles, QKV/Q/K routing, and invalid config/
+    restart. Full pipeline program is 114 bytes (limit 128); `fast`, `g1`,
+    and `regs` all re-passed. Lint: 0 errors, 601 warnings vs baseline 604.
