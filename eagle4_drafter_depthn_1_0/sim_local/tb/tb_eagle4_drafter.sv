@@ -50,7 +50,8 @@ module tb_eagle4_drafter #(
     parameter int TEST_SCALE_DEPTH  = -1,
     // Directed D1 seam timing overrides for variant smoke tests.
     parameter bit TEST_D1_RDLAT = 1'b1,
-    parameter bit TEST_D1_WLAT  = 1'b1
+    parameter bit TEST_D1_WLAT  = 1'b1,
+    parameter bit TEST_BACK_SEQ = 1'b1
 );
     import eagle4_regmap_pkg::*;
 
@@ -140,6 +141,7 @@ module tb_eagle4_drafter #(
         .EMBG_EN  (1'b0),
         .D1_RDLAT (TEST_D1_RDLAT),
         .D1_WLAT  (TEST_D1_WLAT),
+        .BACK_SEQ (TEST_BACK_SEQ),
         .LMDOWN_MEM_DIR_P(LMDOWN_DIR)
     ) dut (
         .ap_clk  (ap_clk),
@@ -687,6 +689,10 @@ module tb_eagle4_drafter #(
             repeat (2_000_000) @(posedge ap_clk);
             $fatal(1, "GEMV-only: global watchdog expired");
         end
+        if ($test$plusargs("GEMV_ACK_ONLY")) begin
+            repeat (500_000) @(posedge ap_clk);
+            $fatal(1, "ACK-only: global watchdog expired");
+        end
     end
 
 
@@ -899,6 +905,23 @@ module tb_eagle4_drafter #(
             $fatal(1, "GEMV: expected HALT at PC=%0d, got %08x", halt_pc, rd);
     endtask
 
+    bit ack_watch = 1'b0;
+    int ack_r2_writes = 0, ack_r4_writes = 0;
+    bit ack_r2_seen = 1'b0, ack_r4_seen = 1'b0;
+    bit ack_early = 1'b0;
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && ack_watch) begin
+            if (dut.r2_seam_we) ack_r2_writes <= ack_r2_writes + 1;
+            if (dut.g7g_seam_we) ack_r4_writes <= ack_r4_writes + 1;
+            if (dut.r2_we_active && (dut.r2_we_cnt == 7)) ack_r2_seen <= 1'b1;
+            if (dut.g7g_we_active && (dut.g7g_we_cnt == 7)) ack_r4_seen <= 1'b1;
+            if (dut.gemv_op_done_w &&
+                ((dut.gemv_op_done_dest_w == 4'd3 && !ack_r2_seen) ||
+                 (dut.gemv_op_done_dest_w == 4'd4 && !ack_r4_seen)))
+                ack_early <= 1'b1;
+        end
+    end
+
     bit tree_watch = 1'b0;
     always @(posedge ap_clk) begin
         if (ap_rst_n && tree_watch && dut.tt_busy && !dut.gemv_busy_w)
@@ -921,6 +944,50 @@ module tb_eagle4_drafter #(
         gv_starts = 0; gv_tiles = 0; gv_errors = 0;
         gv_upload(status);
         gv_watch = 1'b1;
+    endtask
+
+    task automatic run_gemv_ack_only();
+        logic [31:0] st;
+        int lane;
+        $display("[%0t] ---- serializer-ack behavior: HFC -> R2 and HFC -> R4 ----", $time);
+        axil_write(ADDR_HFC_SELECT, 1);
+        gv_load_vector(1'b0, 0, 8);
+        axil_write(ADDR_HFC_SELECT, 0);
+        gv_load_weights(0, 0, 3000, 0, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            gv_load_scale(100, lane, 8192 + lane % 97);
+        tb_sc_we = 1'b0;
+
+        // R2 destination: op_done only after all 8 subchunk writes.
+        gv_reset();
+        gv_config(0, 3000, 1, 8, 8, 0, 100, 1, 3, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        ack_r2_writes = 0; ack_r2_seen = 1'b0; ack_early = 1'b0;
+        ack_watch = 1'b1;
+        gv_wait_op(st);
+        ack_watch = 1'b0;
+        if (!st[1] || st[2] || st[0]) $fatal(1, "ACK R2: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (ack_r2_writes != 8 || !ack_r2_seen || ack_early)
+            $fatal(1, "ACK R2: writes=%0d seen=%0d early_done=%0d", ack_r2_writes, ack_r2_seen, ack_early);
+        $display("[%0t] PASS ACK R2: 8 subchunk writes, op_done only after final ack", $time);
+
+        // R4 gate destination: same check on the 8-way R4 serializer.
+        gv_reset();
+        gv_config(0, 3000, 1, 8, 8, 0, 100, 1, 4, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        gv_begin_run(st);
+        ack_r4_writes = 0; ack_r4_seen = 1'b0; ack_early = 1'b0;
+        ack_watch = 1'b1;
+        gv_wait_op(st);
+        ack_watch = 1'b0;
+        if (!st[1] || st[2] || st[0]) $fatal(1, "ACK R4: bad status %08x", st);
+        gv_check_pc(gv_nb - 1);
+        if (ack_r4_writes != 8 || !ack_r4_seen || ack_early)
+            $fatal(1, "ACK R4: writes=%0d seen=%0d early_done=%0d", ack_r4_writes, ack_r4_seen, ack_early);
+        $display("[%0t] PASS ACK R4: 8 subchunk writes, op_done only after final ack", $time);
+        $display("[%0t] PASS: serializer-ack ordering under BACK_SEQ=%0d", $time, TEST_BACK_SEQ);
     endtask
 
     task automatic run_gemv_only();
@@ -1352,6 +1419,12 @@ module tb_eagle4_drafter #(
 
         if ($test$plusargs("GEMV_ONLY")) begin
             run_gemv_only();
+            $finish;
+            disable main_sequence;
+        end
+
+        if ($test$plusargs("GEMV_ACK_ONLY")) begin
+            run_gemv_ack_only();
             $finish;
             disable main_sequence;
         end
