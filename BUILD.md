@@ -36,6 +36,13 @@ Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`
     loads. Covers all 11 registers, word-crossing/unaligned immediates,
     reserved addresses, restart, end-of-PMEM modulo wrap, reserved
     opcode/JMP/HALT behavior, and a read/WRSR arbitration loop.
+  - Direct binary regressions (built from `tb_eagle4_drafter.sv`):
+    - `+GEMV_ACK_ONLY`: HFC→R2 and HFC→R4 serializer-ack ordering; build with
+      `-GTEST_BACK_SEQ=0` to exercise the pilot path (default 1 also passes).
+    - `+GEMV_DUAL_R1`: real G1-produced R1 crossing 191/192; build with
+      `-GTEST_DUAL_PORT=1 -GTEST_CONNECT_SEAMS=1`. Fill is host AXI HFC/EMB/
+      gamma + STATE G1; the test captures actual producer chunks and checks
+      all 128 Q outputs against e191+h0+h1+h2.
   - `gemv`: assembles and uploads a real WRSR+GEMV program through AXI-Lite,
     loads a deterministic nonzero HFC or EMB activation vector over AXI, writes
     the per-lane weight and scale banks through the simulation-only direct

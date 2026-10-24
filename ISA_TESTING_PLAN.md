@@ -75,6 +75,13 @@ alone, while the scale engine can skip division on its saturation path.
 
 ### Implemented: bounded shared-GEMV cutover
 
+Additional implemented behavioral regressions on the real top:
+`+GEMV_ACK_ONLY` (build `-GTEST_BACK_SEQ=0` for the pilot path; default 1 also
+passes) proves R2/R4 `op_done` occurs only after the 8th subchunk serializer
+ack; `+GEMV_DUAL_R1` (build `-GTEST_DUAL_PORT=1 -GTEST_CONNECT_SEAMS=1`) fills
+real R1 via STATE G1 and proves src3 base191/cpt4 pairs the actual last
+embedding chunk (191) with the first hidden chunks (192+) for all 128 lanes.
+
 `make sim MODE=gemv` runs the real top, PMEM over AXI, HFC/EMB over AXI, and
 the real per-lane weight/scale banks (direct pins are simulation-only). It
 checks every destination word and the probe stream against an independent

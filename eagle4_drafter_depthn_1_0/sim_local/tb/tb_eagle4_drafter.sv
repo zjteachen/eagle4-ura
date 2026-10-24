@@ -931,19 +931,6 @@ module tb_eagle4_drafter #(
         end
     end
 
-    bit dual_watch = 1'b0;
-    int dual_n = 0;
-    logic [15:0] dual_idx [0:7];
-    logic signed [16*16-1:0] dual_a [0:7], dual_b [0:7];
-    always @(posedge ap_clk) begin
-        if (ap_rst_n && dual_watch && dut.array_chunk_idx_valid && dual_n < 8) begin
-            dual_idx[dual_n] <= dut.array_chunk_idx_out;
-            dual_a[dual_n]   <= dut.a_chunk_mux;
-            dual_b[dual_n]   <= dut.a_chunk_b_mux;
-            dual_n <= dual_n + 1;
-        end
-    end
-
     bit ack_watch = 1'b0;
     int ack_r2_writes = 0, ack_r4_writes = 0;
     bit ack_r2_seen = 1'b0, ack_r4_seen = 1'b0;
@@ -1032,7 +1019,7 @@ module tb_eagle4_drafter #(
     task automatic run_gemv_dual_r1();
         logic [31:0] st;
         logic signed [15:0] lo, hi;
-        int lane, raw, waddr;
+        int lane, waddr;
         logic [31:0] w;
         longint esum;
         int i;
@@ -1089,15 +1076,8 @@ module tb_eagle4_drafter #(
 
         gv_begin_run(st);
         r1e_wr_n = 0; r1h_wr_n = 0; r1_capture = 1'b1;
-        dual_n = 0; dual_watch = 1'b1;
         gv_wait_op(st);
-        dual_watch = 1'b0; r1_capture = 1'b0;
-        for (i = 0; i < dual_n; i = i + 1)
-            $display("DUALDBG i=%0d idx=%0d A0=%0d B0=%0d", i, dual_idx[i],
-                     $signed(dual_a[i][0 +: 16]), $signed(dual_b[i][0 +: 16]));
-        $display("DUALDBG cap e191[0]=%0d h0[0]=%0d h1[0]=%0d h2[0]=%0d",
-                 $signed(r1_cap_e191[0 +: 16]), $signed(r1_cap_h0[0 +: 16]),
-                 $signed(r1_cap_h1[0 +: 16]), $signed(r1_cap_h2[0 +: 16]));
+        r1_capture = 1'b0;
         if (!st[1] || st[2] || st[0]) $fatal(1, "DUAL R1: bad status %08x", st);
         if (r1e_wr_n < 192 || r1h_wr_n < 192)
             $fatal(1, "DUAL R1: producer writes e=%0d h=%0d", r1e_wr_n, r1h_wr_n);
