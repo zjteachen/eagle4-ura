@@ -1867,9 +1867,6 @@ module eagle4_drafter #(
         .out2_base(out2_base), .hbm_emb_base(hbm_emb_base),
         .lmfull_hbm_base(lmfull_hbm_base),
 
-        // 0x14C remains a host-readable legacy register only; TREE scan length
-        // is the actual ISA tile_count latched by gemv_shared_ctrl.
-        .n_tiles_cfg(),
         .kc_cfg(kc_cfg),
 
         .accfix_cfg(accfix_cfg_w),

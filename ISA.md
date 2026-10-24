@@ -133,8 +133,8 @@ standalone program step: TREE is the sole G12 client and drives the same
 configured engine tile-by-tile with its own stream backpressure. The TREE
 scan length is the actual ISA `tile_count`, launch-sampled by the tiler and
 validated to 1..1002 (physical TREE capacity) plus the weight/scale spans.
-The legacy AXI `0x14C n_tiles_cfg` register is host-readable only and has NO
-effect on shared execution.
+The legacy AXI `0x14C` scan register is removed and the address is reserved
+(writes ignored, reads 0); it has no execution effect.
 
 `COMPONENTS.md` "ISA State Encodings & Instruction Set" has the full
 historical state table.

@@ -108,7 +108,6 @@ module control_regs #(
     // LEGACY 0x14C scan-length register: retained for host ABI/readback only.
     // TREE scan length now comes solely from the actual ISA special-register
     // tile_count; this value has no shared-engine execution effect.
-    output reg  [15:0] n_tiles_cfg,
 
     // K1 RUNTIME K_C (0x150): # of G8 rescore candidate rows (shortlist size).
     // 0 = compile K_C=512 = RESET DEFAULT, bit-identical when never written.
@@ -540,7 +539,6 @@ module control_regs #(
             out2_base       <= 64'b0;
             hbm_emb_base    <= 64'b0;
             lmfull_hbm_base <= 64'b0;   // G8 SPLICE
-            n_tiles_cfg     <= 16'd0;   // V1 (0x14C): 0 = full-vocab scan default
             kc_cfg          <= 16'd0;   // K1 (0x150): 0 = K_C=512 shortlist default
             accfix_cfg      <= 4'h0;    // ACCFIX (0x15C): reset ALL-OFF = 0x1124-identical
             obs_rd_idx      <= 11'd0;   // OBS_LVL (0x160) read index
@@ -754,7 +752,7 @@ module control_regs #(
                     9'h138: batch_test_ctrl <= s_axi_control_wdata;
                     // SPEEDWAVE-V2 V1 FR-Spec scan tiles (0x14C): 0 = full V.
                     // Launch-sampled at tree_start in the tiler.
-                    9'h14c: n_tiles_cfg <= s_axi_control_wdata[15:0];
+                    // 0x14C is RESERVED (legacy scan register removed): writes ignored.
                     // SPEEDWAVE-V2 K1 runtime K_C (0x150): 0 = compile K_C=512.
                     // Launch-sampled at start in g8_rescore_p.
                     9'h150: kc_cfg <= s_axi_control_wdata[15:0];
@@ -963,7 +961,7 @@ module control_regs #(
                     9'h148:  s_axi_control_rdata <= batch_sib_hi;                             // sib result_q hi + canary
                     // SPEEDWAVE-V2 runtime-config liveness read-backs
                     // (feedback_probe_reg_needs_real_axi_write_and_liveness):
-                    9'h14c:  s_axi_control_rdata <= {16'b0, n_tiles_cfg};    // V1 read-back
+                    9'h14c:  s_axi_control_rdata <= 32'b0;                    // reserved
                     9'h150:  s_axi_control_rdata <= {16'b0, kc_cfg};         // K1 read-back
                     // F3-CLR 0x154 read-back: {"KV" canary, 0, live kv_res_cnt}.
                     // Host verifies the clear TOOK EFFECT: count must read 0
