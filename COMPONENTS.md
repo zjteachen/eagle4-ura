@@ -354,11 +354,11 @@ programs out of a 32-word PMEM (128 bytes). Each instruction is one byte:
 WRSR immediates are little-endian. The two immediate bytes are fetched
 combinationally like every other instruction byte, so they may cross any
 32-bit PMEM word boundary. Byte addressing wraps modulo the 128-byte PMEM
-(existing policy): a WRSR at PC 126 reads its high immediate from byte 0 and
-leaves the next instruction at PC 1; a WRSR at PC 127 reads its high
-immediate from byte 0 and leaves the next instruction at PC 2. A `start_en`
-pulse in the same cycle as a WRSR wins (the bank write is suppressed along
-with the old PC). WRSR to addresses 11..31 is still one bank write strobe,
+(existing policy): at PC 126 the low/high immediate bytes are 127/0 and the
+next instruction starts at PC 1; at PC 127 they are bytes 0/1 and the next
+instruction starts at PC 2. A `start_en` pulse in the same cycle as a WRSR
+wins (the bank write is suppressed along with the old PC). WRSR to addresses
+11..31 is still one bank write strobe,
 but the bank ignores it (reserved writes do not change storage).
 
 The 5-bit STATE operand selects one of the 20 sequencer states below. The

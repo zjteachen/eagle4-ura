@@ -513,8 +513,8 @@ module tb_eagle4_drafter #(
         if (rd !== 32'h5A5A_0008) $fatal(1, "REGS-only: r3 disturbed %08x", rd);
 
         // Program C: end-of-PMEM WRSR. JMP at byte 0 targets word 31; two
-        // WRSRs at bytes 124 and 127. The byte-127 instruction's immediates
-        // are bytes 127 (low) and the wrapped byte 0 (high); PC then wraps
+        // WRSRs at bytes 124 and 127. The byte-127 instruction's immediate
+        // bytes are the wrapped bytes 0 (low) and 1 (high); PC then wraps
         // to byte 2, where HALT sits.
         pmem_write_at(0,  32'h4040_5A3F, 1, "program C word0");
         pmem_write_at(31, 32'h6512_3464, 0, "program C word31");

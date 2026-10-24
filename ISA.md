@@ -28,9 +28,10 @@ byte 2: immediate[15:0] high byte
 
 The immediate is little-endian. Both immediate bytes are fetched
 combinationally, so they may cross a 32-bit PMEM word boundary. Byte
-addressing wraps modulo 128: a WRSR at PC 126 or 127 reads its high
-immediate byte from PMEM byte 0 (and byte 1 respectively), and the following
-instruction starts at PC 1 or 2. Exactly one bank write strobe is produced
+addressing wraps modulo 128: at PC 126 the low immediate is byte 127, the
+high immediate is byte 0, and the next instruction starts at PC 1; at
+PC 127 the low immediate is byte 0, the high immediate is byte 1, and the
+next instruction starts at PC 2. Exactly one bank write strobe is produced
 per WRSR; a simultaneous `start_en` wins and suppresses it. Reserved
 register addresses still strobe the bank but change no storage and read as
 zero.

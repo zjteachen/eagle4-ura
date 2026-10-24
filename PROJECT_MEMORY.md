@@ -52,7 +52,8 @@
     (`0x60|reg`, imm low, imm high). Executes in one cycle, produces exactly
     one bank write strobe, advances PC by 3. Immediates are fetched
     combinationally and may cross PMEM word boundaries; byte addressing
-    wraps modulo 128 (PC 126/127 read wrapped bytes). Reserved opcodes
+    wraps modulo 128 (at PC 126: imm bytes 127/0, resume at 1;
+    at PC 127: imm bytes 0/1, resume at 2). Reserved opcodes
     `100..111` remain HALT; JMP/STATE/HALT semantics unchanged.
   - `special_regs.sv`: expanded to 11 x 16-bit entries (0..10) while
     preserving reset > write > read precedence, reserved-write ignore /

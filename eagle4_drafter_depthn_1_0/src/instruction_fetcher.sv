@@ -19,9 +19,10 @@
 *               autonomously in one cycle: assert sr_write_en for exactly
 *               one cycle and PC += 3. The two immediate bytes are fetched
 *               combinationally and may cross a PMEM word boundary; byte
-*               addressing is modulo the 128-byte PMEM (e.g. a WRSR at PC
-*               127 reads its high immediate byte from PC 0 and leaves the
-*               next instruction at PC 2).
+*               addressing is modulo the 128-byte PMEM. At PC 126 the low
+*               and high immediates are bytes 127 and 0 and execution
+*               resumes at PC 1; at PC 127 they are bytes 0 and 1 and
+*               execution resumes at PC 2.
 *   100..111   Reserved. Decodes as HALT (fail-safe stop) so an
 *               under-programmed PMEM can never free-run the pipeline.
 *
@@ -92,8 +93,8 @@ module instruction_fetcher (
     endfunction
 
     // 7-bit additions wrap modulo 128, matching the existing end-of-PMEM
-    // policy. A WRSR at byte 127 therefore reads its high immediate from
-    // byte 0 and leaves the next instruction at byte 2.
+    // policy. At PC 126 the immediates are bytes 127/0 and PC becomes 1;
+    // at PC 127 they are bytes 0/1 and PC becomes 2.
     wire [6:0] wrsr_imm_lo_addr = PC + 7'd1;
     wire [6:0] wrsr_imm_hi_addr = PC + 7'd2;
 
