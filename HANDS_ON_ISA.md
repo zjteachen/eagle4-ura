@@ -34,8 +34,11 @@ reset > write > read precedence. That behavior is preserved for addresses
 | 10 | `output_conversion` |
 
 Addresses 11..31 are reserved. The module decodes the raw entries into
-configuration outputs for the GEMV operation controller (the controller and
-numeric validation are the follow-on integration task).
+configuration outputs consumed by `gemv_shared_ctrl`, which latches them at
+GEMV START / TREE session start. Numeric/geometry validation is implemented
+there (qzero=1, scale_frac=13, output_conversion=0, chunks_per_scale_group in
+{4,8}, capacity/bounds checks). These bank outputs are the sole ISA
+configuration source for the shared engine.
 
 ## Interface
 

@@ -40,11 +40,23 @@ Task tracker for EAGLE-3 draft-head FPGA offload (`eagle4_drafter_depthn_1_0/`, 
       immediates, reserved addresses, restart, end-of-PMEM wrap, JMP/HALT,
       reserved opcode, and a dense WRSR/read arbitration loop.
 
-### Next ISA stage (not implemented)
+### Shared GEMV cutover (completed)
 
-- [ ] GEMV opcode + real shared-engine START/wait, status, tile controller,
-      activation/output routing, and configuration latch/validation. No
-      descriptor bypass or mocked/no-op GEMV path.
+- [x] GEMV opcode `100`/`0x80` with real shared-engine START/wait, sticky
+      BUSY/DONE/ERROR (`0x170`), active tile (`0x174`), configuration latch
+      and validation. One `gemv_shared_ctrl` owns tile loop/base settle/
+      start/store/drain/DONE.
+- [x] Explicit weight/scale bases and runtime chunk/group bounds replace
+      stage-derived lookups in the scaled array and both banks; runtime
+      `chunks_per_scale_group` supports 4 and 8.
+- [x] Activation-source (0..7) and output-destination (0..6/9) routing into
+      the real buffers with the existing destination serializers and
+      downstream attention/norm/residual side effects.
+- [x] TREE is a client of the same configured engine with real backpressure;
+      standalone G12 STATE start removed. Standard G9 is 24 tiles.
+- [x] `make sim MODE=gemv` all-lane independent-oracle verification of HFC/EMB
+      loading, QKV/Q/K destinations, nonzero bases, two tiles, groups 4/8,
+      and invalid-config/restart. Full pipeline program is 114 bytes.
 
 ## Completed Tooling
 

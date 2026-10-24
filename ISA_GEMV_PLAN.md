@@ -2,17 +2,36 @@
 
 ## Current implementation status (2026-10)
 
-Stage 1 is implemented and committed: WRSR (opcode `011`, three-byte
-little-endian immediate) writes the 11-entry ISA special-register bank, the
-fetcher advances `PC += 3`, and the actual bank is readable over AXI
-(`0x178` selector, `0x17C` `{16'h5A5A, read_data}` with synchronous-read
-retry under WRSR arbitration). The bank exposes decoded configuration
-outputs for the future operation controller. The shared GEMV datapath,
-operation START/BUSY/DONE status, tile controller, input/output routing,
-and GEMV opcode are **not yet implemented**; the next stage integrates the
-real engine and latches these fields at START. Numeric-field validation
-(e.g. supported `scale_frac`, `qzero_raw`, group size) also belongs to that
-engine stage, not to the register bank.
+Implemented and committed in the shared-engine cutover:
+
+- WRSR (opcode `011`, three-byte little-endian immediate) writes the 11-entry
+  actual `special_regs` bank; AXI readback is `0x178`/`0x17C`.
+- GEMV (opcode `100`, byte `0x80`) latches the actual bank outputs at START
+  and blocks the PC until operation DONE or a validated configuration ERROR.
+  Other operands of opcode 100 and all reserved opcodes decode as HALT.
+- One `gemv_shared_ctrl` owns the tile loop, explicit per-tile weight/scale
+  base settle, array start, result-valid/store handshake, drain, and DONE.
+  Its bases/bounds are explicit: the old stage-derived base/stride and
+  compile-time group lookups are gone from the scaled array and both banks.
+- Runtime `chunks_per_scale_group` genuinely supports 4 and 8 (latched group
+  mask/shift in the lane and its group-tag pipeline). All other values are
+  rejected before launch, as are unsupported qzero/scale_frac/conversion and
+  out-of-capacity spans.
+- Activation sources 0..7 and destinations 0..6/9 route real address+data
+  into the existing buffers; destination-specific serializers/conversions
+  and downstream residual/norm/attention side effects are retained. DONE
+  waits for the final destination store.
+- TREE is a client of the same configured engine with real stream
+  backpressure. The standalone G12 STATE program step is removed. Standard
+  G9 is 24 tiles (R6 capacity), or 48 with FORREASON.
+- The full pipeline is expressed as WRSR + GEMV + the remaining non-shared
+  STATE instructions; the delta-WRSR program is 114 bytes (limit 128).
+
+Verification: `run_sim.sh gemv` runs the real top with real banks, AXI PMEM,
+HFC/EMB AXI loads, all-lane independent integer-oracle checks of destination
+buffers and the probe, nonzero bases with two tiles, runtime groups 4/8,
+routing alternatives, and invalid-config/restart. This is a bounded
+fixture, not a claim of whole-model arithmetic accuracy.
 
 ## Scope
 

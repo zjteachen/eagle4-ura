@@ -73,6 +73,16 @@ The fixture gives both input vectors the same sum of squares; differing norm
 latencies are not covered. The ISA currently advances on hidden `g1_done`
 alone, while the scale engine can skip division on its saturation path.
 
+### Implemented: bounded shared-GEMV cutover
+
+`make sim MODE=gemv` runs the real top, PMEM over AXI, HFC/EMB over AXI, and
+the real per-lane weight/scale banks (direct pins are simulation-only). It
+checks every destination word and the probe stream against an independent
+integer oracle for HFC->QKV, runtime cpg=4, nonzero act/weight/scale/output
+bases with two tiles, EMB->K routing, and invalid-config error/restart. See
+`ISA.md` for the validated numeric/routing contract. This is a bounded
+fixture, not whole-model arithmetic validation.
+
 ## Phase 2 — Microprogram instruction testing
 
 Goal: exercise the ISA machinery itself.

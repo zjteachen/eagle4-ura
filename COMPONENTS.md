@@ -349,7 +349,8 @@ programs out of a 32-word PMEM (128 bytes). Each instruction is one byte:
 | `001` | JMP | PMEM word address (0..31) | `PC <- {operand, 2'b00}`; executes in one cycle, target must be word-aligned |
 | `010` | HALT | reserved (0) | Stop execution; one-cycle `halted` pulse (kernel done); PC stays at the HALT byte |
 | `011` | WRSR | special-register address (0..10) | Three bytes: header `0x60\|addr`, immediate low byte, immediate high byte. Executes in one cycle: exactly one `special_regs` write, `PC += 3` |
-| `100`-`111` | reserved | — | Decode as HALT (fail-safe stop; an under-programmed PMEM cannot free-run) |
+| `100` | GEMV | `0x80` only | Latch the actual bank configuration, run the shared engine tile loop, and hold PC until DONE or a validated configuration ERROR. Other operands of opcode 100 decode as HALT |
+| `100` other operands, `101`-`111` | reserved | — | Decode as HALT (fail-safe stop; an under-programmed PMEM cannot free-run) |
 
 WRSR immediates are little-endian. The two immediate bytes are fetched
 combinationally like every other instruction byte, so they may cross any
@@ -361,22 +362,25 @@ wins (the bank write is suppressed along with the old PC). WRSR to addresses
 11..31 is still one bank write strobe,
 but the bank ignores it (reserved writes do not change storage).
 
-The 5-bit STATE operand selects one of the 20 sequencer states below. The
-values reuse the `top_fsm` state enum numerically, so debug taps
-(`dbg_stage_capture` `top_state`, PMEM status readback) keep their meaning
-across the FSM-to-ISA migration.
+STATE operands are now limited by `instruction_fetcher.state_valid_mask`
+(0x0000_6A8A): implemented IDs are G1=1, G5=3, G7_SILU=7, G11=9, TREE=11,
+GLM=13 and G8=14. The former shared-stage operands G4=2, G6=4, G7G=5,
+G7U=6, G9=8 and G12=10 are RETIRED and decode as HALT; their engine work is
+expressed by GEMV 0x80 with explicit special-register configuration. The
+table below is retained as the historical/top_fsm enum reference, not as the
+current launch path for the retired rows.
 
 | Value | State | Description |
 | :--- | :--- | :--- |
 | `5'd0` | `S_IDLE` | Idle; no stage active. Reserved in ISA mode (a program starts at `PC=0` on `ap_start`, never in IDLE). |
 | `5'd1` | `S_G1` | Separate 3072-element RMSNorms over hidden-state and embedding streams (two parallel `rmsnorm_block` instances with DEPTH_N=0; a third embedding-requantization instance exists only with DEPTH_N=1). No QKV projection; that is G4. |
-| `5'd2` | `S_G4` | QKV projection GEMV on the shared array (`stage_sel=0`). |
+| `5'd2` | `S_G4` | **Retired STATE ID.** QKV projection is `GEMV` with activation_source=3, output_destination=9, 72 tiles. |
 | `5'd3` | `S_G5_ROPE` | Rotary embedding on Q/K and KV-cache append; KV-only launches terminate here. |
-| `5'd4` | `S_G6` | Multi-head attention over the windowed KV cache (`stage_sel=1`). |
-| `5'd5` | `S_G7G` | MLP gate projection GEMV (`stage_sel=2`). |
-| `5'd6` | `S_G7U` | MLP up projection GEMV (`stage_sel=3`). |
+| `5'd4` | `S_G6` | **Retired STATE ID.** Output projection is `GEMV` with source 7, destination 3. |
+| `5'd5` | `S_G7G` | **Retired STATE ID.** Gate projection is `GEMV` with source 4, destination 4. |
+| `5'd6` | `S_G7U` | **Retired STATE ID.** Up projection is `GEMV` with source 4, destination 5. |
 | `5'd7` | `S_G7_SILU` | SwiGLU activation, `SiLU(gate) * up`. |
-| `5'd8` | `S_G9` | MLP down projection GEMV + residual add (`stage_sel=4`). |
+| `5'd8` | `S_G9` | **Retired STATE ID.** Down projection is `GEMV` with source 5, destination 6; 24 tiles (48 with FORREASON). |
 | `5'd9` | `S_G11` | Pre-head RMSNorm (`u_rmsnorm_g11`). |
 | `5'd10` | `S_G12` | LM head projection GEMV to cheap vocab logits (`stage_sel=5`). |
 | `5'd11` | `S_TREE` | Speculative tree scan and top-K selection over the cheap logits. |
@@ -750,7 +754,8 @@ priority), so `0x17C` never silently returns stale data.
 - **`clk`**
 - **`rst_en`** — active-low synchronous reset
 - **`start_en`** — 1-cycle launch pulse (ap_start): PC <- 0, begin execution
-- **`adv_en`** — advance strobe: the current STATE instruction's stage done
+- **`adv_en`** — advance strobe: current STATE done or GEMV DONE/ERROR
+- `[31:0]` **`state_valid_mask`** — bit i enables STATE operand i; clear bits decode as HALT
 - **`write_en`** / `[7:0]` **`write_addr`** / `[31:0]` **`write_data`** — PMEM program port
 
 *Outputs:*
@@ -764,9 +769,24 @@ priority), so `0x17C` never silently returns stale data.
 - **`sr_write_en`** — 1-cycle WRSR bank write strobe (exactly one per WRSR)
 - `[4:0]` **`sr_write_sel`** — WRSR register address (header bits 4:0)
 - `[15:0]` **`sr_write_data`** — WRSR immediate, little-endian byte order
+- **`gemv_pulse`** — 1-cycle pulse at GEMV `0x80`
+- **`is_gemv`** — level: current instruction is GEMV
 
 **Wiring & Hierarchy:**
 - **Instantiated By:** `eagle4_drafter` (`eagle4_drafter.sv`)
+- **Instantiates:** *(Leaf module)*
+
+---
+
+### `gemv_shared_ctrl`
+- **Source File:** `eagle4_drafter_depthn_1_0/src/gemv_shared_ctrl.sv`
+- **Construct Type:** `module`
+- **Technical Purpose:** Sole owner of shared-GEMV operation sequencing. Latches the actual `special_regs` configuration at ISA GEMV START (and TREE session start), validates numeric/geometry/routing bounds, advances explicit weight/scale tile bases with a settle cycle, starts one array tile at a time, qualifies result-valid, waits for the destination adapter's store acknowledgement, and asserts DONE only after the final store. Also serves TREE client tiles (`tt_gemv_start`) with real stream backpressure and owns sticky BUSY/DONE/ERROR plus the active tile.
+
+**Ports:** ISA start + all 11 decoded configuration fields; `act_ready` (source seam readiness); array `array_done`/`array_start` + explicit `arr_weight_base`/`arr_scale_base`/`arr_chunks_per_tile`/`arr_chunks_per_scale_group`; destination `tile_valid`/`tile_dest`/`store_idx`/`store_ack`; TREE `client_session_start`/`client_start`/`client_tile_idx`/`client_error`; status `busy`/`done_sticky`/`error_sticky`/`active_tile` and ISA termination `op_start`/`op_done`/`op_error`.
+
+**Wiring & Hierarchy:**
+- **Instantiated By:** `eagle4_drafter` (`u_gemv_ctrl`)
 - **Instantiates:** *(Leaf module)*
 
 ---
