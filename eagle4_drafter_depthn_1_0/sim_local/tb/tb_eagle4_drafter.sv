@@ -47,7 +47,10 @@ module tb_eagle4_drafter #(
     // it only reads what a given stage's addressing touches. Defaults to
     // the true depth so "no override" == the real, complete load.
     parameter int TEST_WEIGHT_DEPTH = -1,
-    parameter int TEST_SCALE_DEPTH  = -1
+    parameter int TEST_SCALE_DEPTH  = -1,
+    // Directed D1 seam timing overrides for variant smoke tests.
+    parameter bit TEST_D1_RDLAT = 1'b1,
+    parameter bit TEST_D1_WLAT  = 1'b1
 );
     import eagle4_regmap_pkg::*;
 
@@ -135,6 +138,8 @@ module tb_eagle4_drafter #(
         .G8_SPLICE(1'b0),
         .DEPTH_N  (1'b0),
         .EMBG_EN  (1'b0),
+        .D1_RDLAT (TEST_D1_RDLAT),
+        .D1_WLAT  (TEST_D1_WLAT),
         .LMDOWN_MEM_DIR_P(LMDOWN_DIR)
     ) dut (
         .ap_clk  (ap_clk),
@@ -1107,9 +1112,9 @@ module tb_eagle4_drafter #(
         tb_a_chunk = '0;
 
         // ---------------- Test G: directed valid short TREE -----------------
-        // ISA tile_count=4, legacy n_tiles_cfg=2: the tiler must receive the
-        // accepted session count (2), not the stale legacy value, and status
-        // must stay BUSY until the whole stream drains and then latch DONE.
+        // ISA tile_count=4, legacy n_tiles_cfg=2: TREE must run FOUR tiles
+        // (the actual ISA count only; the legacy 0x14C is ignored), and BUSY
+        // must stay high until the stream drains before DONE latches.
         gv_reset();
         gv_config(0, 2048, 4, 16, 8, 0, 512, 0, 7, 13);
         gv_byte(8'h0b); gv_byte(8'h40);
@@ -1132,24 +1137,32 @@ module tb_eagle4_drafter #(
         if (!st[1] || st[2] || st[0])
             $fatal(1, "GEMV G: valid TREE bad status %08x", st);
         gv_check_pc(gv_nb - 1);
-        if (gv_starts != 2 || gv_tiles != 2 || gv_errors != 0)
-            $fatal(1, "GEMV G: expected 2 tiles from accepted ncfg, got starts=%0d tiles=%0d err=%0d",
+        if (gv_starts != 4 || gv_tiles != 4 || gv_errors != 0)
+            $fatal(1, "GEMV G: expected 4 ISA tiles (legacy 2 ignored), got starts=%0d tiles=%0d err=%0d",
                    gv_starts, gv_tiles, gv_errors);
-        $display("[%0t] PASS GEMV G: valid TREE uses accepted session count (2 of ISA tile_count=4), BUSY held through drain", $time);
+        $display("[%0t] PASS GEMV G: TREE runs 4 tiles from ISA tile_count, legacy n_tiles_cfg=2 ignored, BUSY held through drain", $time);
 
-        // ---------------- Test H: invalid TREE scan length + restart --------
-        axil_write('h14c, 5);       // > ISA tile_count=4 => reject before launch
+        // ---------------- Test H: invalid ISA TREE count + restart ----------
+        // ISA tile_count=1003 exceeds the 1002-tile TREE capacity. The legacy
+        // 0x14C value is 5 and must not rescue or alter the decision.
+        gv_reset();
+        gv_config(0, 2048, 1003, 16, 8, 0, 512, 0, 7, 13);
+        gv_byte(8'h0b); gv_byte(8'h40);
+        axil_write(0'h14c, 5);
         gv_begin_run(st);
         tree_watch = 1'b1;
         gv_wait_op(st);
         tree_watch = 1'b0;
         if (gv_starts != 0 || gv_tiles != 0 || gv_errors != 1)
-            $fatal(1, "GEMV H: invalid TREE launched (starts=%0d tiles=%0d err=%0d)",
+            $fatal(1, "GEMV H: invalid ISA TREE count launched (starts=%0d tiles=%0d err=%0d)",
                    gv_starts, gv_tiles, gv_errors);
         if (!st[2] || st[1] || st[0])
             $fatal(1, "GEMV H: bad status %08x (want ERROR only)", st);
         gv_check_pc(gv_nb - 1);
-        axil_write('h14c, 1);       // restart with valid count
+        // Restart with a valid ISA count=1 while the legacy register stays 5.
+        gv_reset();
+        gv_config(0, 2048, 1, 16, 8, 0, 512, 0, 7, 13);
+        gv_byte(8'h0b); gv_byte(8'h40);
         gv_begin_run(st);
         tree_watch = 1'b1;
         gv_wait_op(st);
@@ -1159,7 +1172,9 @@ module tb_eagle4_drafter #(
         if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
             $fatal(1, "GEMV H restart: starts=%0d tiles=%0d err=%0d",
                    gv_starts, gv_tiles, gv_errors);
-        $display("[%0t] PASS GEMV H: invalid TREE count rejected without lane start; restart with accepted count completes", $time);
+        $display("[%0t] PASS GEMV H: ISA count>1002 rejected without lane start; ISA restart=1 completes with legacy 0x14C ignored", $time);
+        tb_a_chunk = '0;
+
         tb_a_chunk = '0;
 
         // ---------------- Test E: invalid configs terminate without launch -

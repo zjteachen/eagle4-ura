@@ -34,6 +34,7 @@ module gemv_shared_ctrl #(
     parameter int K_PAR      = 16,
     parameter int K_MAX      = 8192,
     parameter int G9_NTILES  = 24,       // FORREASON ? 48 : 24 (pass from top)
+    parameter int TREE_NTILES = 1002,    // physical TREE tile capacity
     parameter int WEIGHT_DEPTH = (96 * 1024 * 128) / LANES,
     parameter int SCALE_DEPTH  = (16 * 1024 * 128) / LANES
 ) (
@@ -82,7 +83,6 @@ module gemv_shared_ctrl #(
     input  wire        client_session_start,  // tree_start: latch config
     input  wire        client_active,         // tiler owns the engine this walk
     input  wire        client_start,          // tt_gemv_start: one tile
-    input  wire [15:0] client_n_tiles_cfg,    // legacy scan-length selector
     input  wire        client_session_done,   // tree_done: walk + stream drained
     input  wire [15:0] client_tile_idx,
     output logic       client_error,          // pulse: request/config rejected
@@ -162,8 +162,6 @@ module gemv_shared_ctrl #(
     logic [15:0] rows_v;
     logic [31:0] w_span, s_span, o_span, a_span;
     logic        common_ok, isa_cfg_ok, client_cfg_ok;
-    wire [15:0]  client_n_eff =
-        (client_n_tiles_cfg == 16'd0) ? cfg_tile_count : client_n_tiles_cfg;
 
     always_comb begin
         rows_v = (cfg_chunks_per_scale_group == 16'd4) ? (cfg_chunks_per_tile >> 2)
@@ -197,12 +195,14 @@ module gemv_shared_ctrl #(
                      dest_is_isa(cfg_output_destination) &&
                      (o_span <= 32'(dest_tiles(cfg_output_destination)));
 
-        // TREE scan length is a selector WITHIN the ISA-configured operation:
-        // 0 means the full configured span; any explicit count must fit it.
+        // TREE has ONE count source: the actual ISA tile_count. It is
+        // launch-sampled by the tiler and must fit the physical TREE capacity
+        // and the validated weight/scale spans (already in common_ok).
         client_cfg_ok = common_ok &&
                         (cfg_output_destination == 4'd7) &&
                         (cfg_output_base == 16'd0) &&
-                        (client_n_eff <= cfg_tile_count);
+                        (cfg_tile_count >= 16'd1) &&
+                        (cfg_tile_count <= 16'(TREE_NTILES));
     end
 
     assign client_config_ok = client_cfg_ok;
@@ -229,7 +229,7 @@ module gemv_shared_ctrl #(
 
     assign busy         = (state != S_IDLE) || client_session_q;
     assign active_tile  = tile_q;
-    assign client_scan_tiles = client_n_eff;
+    assign client_scan_tiles = cfg_tile_count;
     assign tile_dest    = dest_q;
     assign store_idx    = store_idx_q;
     assign arr_weight_base = wbase_t_q;

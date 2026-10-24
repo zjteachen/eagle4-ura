@@ -105,10 +105,9 @@ module control_regs #(
     // ABI (kept intact below). The two runtime-config registers live at the
     // next free single-word slots 0x14C/0x150 instead.
     //
-    // V1 FR-SPEC VARIABLE SCAN (0x14C): # of 128-lane G12 tiles to walk per
-    // tree scan. 0 = full vocab (compile N_TILES=1002) = RESET DEFAULT,
-    // bit-identical when never written. Consumed launch-sampled at tree_start
-    // in the tiler (VARIABLE_VOCAB_RTL_PLAN.md §3; jewel W1 pack).
+    // LEGACY 0x14C scan-length register: retained for host ABI/readback only.
+    // TREE scan length now comes solely from the actual ISA special-register
+    // tile_count; this value has no shared-engine execution effect.
     output reg  [15:0] n_tiles_cfg,
 
     // K1 RUNTIME K_C (0x150): # of G8 rescore candidate rows (shortlist size).

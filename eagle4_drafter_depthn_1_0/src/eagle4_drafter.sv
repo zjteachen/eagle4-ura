@@ -339,7 +339,6 @@ module eagle4_drafter #(
     wire         [8*TREE_IDX_W-1:0] tree_topk_indices;
     wire                            tree_done;
 
-    wire [15:0] n_tiles_cfg;
     wire [15:0] kc_cfg;
 
     wire [3:0]  accfix_cfg_w;
@@ -1868,7 +1867,9 @@ module eagle4_drafter #(
         .out2_base(out2_base), .hbm_emb_base(hbm_emb_base),
         .lmfull_hbm_base(lmfull_hbm_base),
 
-        .n_tiles_cfg(n_tiles_cfg),
+        // 0x14C remains a host-readable legacy register only; TREE scan length
+        // is the actual ISA tile_count latched by gemv_shared_ctrl.
+        .n_tiles_cfg(),
         .kc_cfg(kc_cfg),
 
         .accfix_cfg(accfix_cfg_w),
@@ -2290,7 +2291,8 @@ module eagle4_drafter #(
     wire gemv_act_ready_w;   // source readiness, assigned with the source mux
     gemv_shared_ctrl #(
         .LANES(LANES), .K_PAR(K_PAR), .K_MAX(K_MAX),
-        .G9_NTILES(FORREASON ? (6144 / LANES) : (3072 / LANES))
+        .G9_NTILES(FORREASON ? (6144 / LANES) : (3072 / LANES)),
+        .TREE_NTILES(TREE_N_TILES)
     ) u_gemv_ctrl (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .isa_start(fetch_gemv_pulse_w),
@@ -2325,7 +2327,6 @@ module eagle4_drafter #(
         .client_error(gemv_client_error_w),
         .client_config_ok(gemv_client_cfg_ok_w),
         .client_scan_tiles(gemv_client_scan_tiles_w),
-        .client_n_tiles_cfg(n_tiles_cfg),
         .client_session_done(tree_done),
         .busy(gemv_busy_w),
         .done_sticky(gemv_done_w),
@@ -2731,14 +2732,13 @@ module eagle4_drafter #(
 
     wire [PREMLP_CW-1:0] premlp_rd_idx_b = act_addr_b_w[PREMLP_CW-1:0];
 
-    // HFC / input-embedding banks are asynchronous array reads. Their
-    // adapter latency must match the COMPILED array/consumer contract:
-    //   * scaled SLR array + registered activation source buffers (production
-    //     D1_RDLAT=1): one register, same as the other RD_LAT=1 seams;
-    //   * unscaled/K_PAR64 arrays (lane consumes the current chunk
-    //     combinationally) or D1_RDLAT=0: combinational, no fake delay.
-    localparam bit GEMV_SRC_REG = GEMV_SCALED && !GEMV_KPAR64 && SLR_SAFE &&
-                                  D1_RDLAT;
+    // HFC / input-embedding banks are asynchronous array reads. The lane's
+    // weight/valid delay is controlled by D1_WLAT, while the array's exposed
+    // chunk lookahead already compensates the SLR forward seam. Match the
+    // async source to WLAT:
+    //   * scaled K_PAR16 lane with WLAT=1: one register (production);
+    //   * scaled WLAT=0, unscaled or K_PAR64: combinational.
+    localparam bit GEMV_SRC_REG = GEMV_SCALED && !GEMV_KPAR64 && D1_WLAT;
     wire signed [K_PAR*A_WIDTH-1:0] hfc_act_rd_w,  hfc_act_rd_b_w;
     wire signed [K_PAR*A_WIDTH-1:0] emb_act_rd_w,  emb_act_rd_b_w;
     generate
