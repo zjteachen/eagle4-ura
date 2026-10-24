@@ -90,6 +90,16 @@ bases with two tiles, EMB->K routing, and invalid-config error/restart. See
 `ISA.md` for the validated numeric/routing contract. This is a bounded
 fixture, not whole-model arithmetic validation.
 
+`make sim MODE=gemv-demo` is the small editable counterpart. It reads
+`sim_local/tb/gemv_demo_program.hex` at run time, requires the fixed
+11-WRSR + GEMV + HALT shape (rejecting missing, malformed, structurally
+wrong, or oversized files before execution), and runs the same case-A
+fixture/oracle. It prints PMEM words, all 11 special-register AXI readbacks,
+`0x170` status, and the first actual/expected lanes. Use
+`+GEMV_DEMO_PROG=<file>` with the built binary to rerun an edited file
+without rebuilding. No general assembler is involved; see
+`GEMV_WALKTHROUGH.md`.
+
 ## Phase 2 — Microprogram instruction testing
 
 Goal: exercise the ISA machinery itself.

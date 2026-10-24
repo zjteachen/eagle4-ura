@@ -10,6 +10,7 @@ make lint TOP=<module>    # Lint specific submodule
 make sim MODE=g1          # Isolated ISA test: STATE G1; HALT (no weight load)
 make sim MODE=regs        # ISA WRSR -> special_regs AXI readback (no loads)
 make sim MODE=gemv        # bounded real shared-GEMV cutover (HFC/EMB, groups 4/8)
+make sim MODE=gemv-demo   # editable PMEM program -> real case-A GEMV demo
 make sim MODE=fast        # Fast smoke test (~30s, depth=8, sanity only)
 make sim                  # Full smoke test (hardware depth, tens of minutes)
 make synth                # Vivado OOC synthesis (default: V80, 100 MHz; requires Vivado)
@@ -28,7 +29,7 @@ Lints and elaborates SystemVerilog RTL (`eagle4_drafter_depthn_1_0/src/*.sv`) lo
 
 Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`) compiles with `verilator --binary`. Validates I/O plumbing, load paths, control flow, and `OUT_ABI_V24` frontier formatting. Does not evaluate numerical accuracy.
 
-- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast|g1|regs|gemv]`
+- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast|g1|regs|gemv|gemv-demo]`
   - `fast`: sets `TEST_WEIGHT_DEPTH=8` and `TEST_SCALE_DEPTH=8` (~30s).
   - Default: full hardware-scale depth (~14.7M pokes, tens of minutes).
   - `regs`: uploads WRSR microprograms over AXI and exercises the actual
@@ -52,6 +53,17 @@ Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`
     nonzero activation/weight/scale/output bases with two tiles, EMB -> K
     routing, and invalid-config error/restart. It does not claim whole-model
     arithmetic accuracy.
+  - `gemv-demo`: reads the annotated byte listing
+    `sim_local/tb/gemv_demo_program.hex` at run time, requires exactly
+    11 WRSR + GEMV + HALT, uploads it through the same AXI PMEM mailbox, and
+    runs the shared case-A HFC -> QKV fixture. It prints the byte/word count,
+    PMEM upload status, all 11 actual special-register AXI readbacks, `0x170`
+    status, and the first actual/expected lanes, then checks all 128 lanes
+    against the case-A oracle. A missing, malformed, structurally wrong, or
+    oversized file exits nonzero before execution. `+GEMV_DEMO_PROG=<file>`
+    overrides the default at run time and
+    `sim_local/obj_dir_sim/sim_tb +GEMV_DEMO` reruns without a rebuild; see
+    `GEMV_WALKTHROUGH.md`.
   - `g1`: uploads `STATE G1; HALT` through AXI-Lite, loads deterministic
     full-size hidden/embedding vectors and their two gamma vectors, and skips
     WEIGHT/SCALE loading. Checks one G1 launch, 192 ordered output chunks per
@@ -60,14 +72,16 @@ Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`
     an ISA execution test, not a numerical-reference comparison; see
     `ISA_TESTING_PLAN.md` for the G1 arithmetic/reference proposal.
 - **Configuration**: Overrides `G8_SPLICE=0`, `DEPTH_N=0`, `EMBG_EN=0` to single-step execution; exercises write-DMA (`m_axi_out`) without HBM round-trips. The full smoke program is a 114-byte delta-WRSR/GEMV pipeline (limit 128 bytes): `STATE G1; GEMV QKV; STATE G5; GEMV R2; GEMV R4g; GEMV R4u; STATE G7_SILU; GEMV R6; STATE G11; STATE GLM; WRSR G12 config; STATE TREE; HALT`.
-- **Load paths**: Random weights/scales loaded via direct-drive pins (`boot_we`, `tb_sc_we`); EMB/HFC/GAMMA loaded via AXI4-Lite registers (`sim_local/tb/eagle4_regmap_pkg.sv`). Verified via `dbg_residency.sv`.
+- **Load paths**: Random weights/scales loaded via direct-drive pins (`boot_we`, `tb_sc_we`); EMB/HFC/GAMMA loaded via AXI4-Lite registers (`sim_local/tb/eagle4_regmap_pkg.sv`). `gemv-demo` uses the same paths: its HFC activation and PMEM program go over AXI, while the deterministic weight/scale fixture is written through the simulation-only direct pins, not an FPGA boot DMA. Verified via `dbg_residency.sv`.
 - **Known simulation caveats**:
   - Current source defaults set `CONNECT_SEAMS=0`; the testbench's external
     `a_chunk` is zero, so G4 does not numerically exercise the G1→G4 connection.
-  - The fast smoke's immediate PMEM pointer read can report 3 rather than 4
-    after four writes, before the final registered commit. The G1-only path
-    polls for commit. The general smoke prints failed checks but uses `$finish`,
-    so inspect its final verdict rather than trusting exit status alone.
+  - The general and `fast` smokes print failed checks but use `$finish`, so
+    read the final verdict; their process exit status alone is not a FAIL
+    indication. PMEM program uploads poll the committed word pointer before
+    checking instructions; the 114-byte pipeline is 29 words, so the old
+    "immediate pointer read can report 3 after four writes" caveat no longer
+    applies.
   - `SCALE` residency reads 0: `dbg_residency.sv:7686` monitors `dma_sc_we`, missing `tb_sc_we`. Functional data still loads into `scale_bram`.
   - RoPE table uninitialized: `rope_layer.sv:284, 328` hardcodes missing path `/home/y344shi/eagle4_artifacts/p4/rope_cs.hex`. `cos_t=sin_t=0` zeroes Q/K outputs in `rope_pair_rotate.sv`, rendering downstream output weight-independent.
   - Performance: ~100–130 µs sim time/s. RTL contains snapshot logic (`SIM_WSNAP`, `+WSNAP_DUMP`, `+WSNAP_LOAD` in `weight_bank_uram.sv`), but it is not yet wired into `run_sim.sh`.

@@ -66,6 +66,9 @@ Task tracker for EAGLE-3 draft-head FPGA offload (`eagle4_drafter_depthn_1_0/`, 
 - [x] Repository setup and `.gitignore`.
 - [x] Tier A end-to-end smoke test in `sim_local/tb/` (`make sim [MODE=fast]`, `OUT_ABI_V24` validation).
   - *Future Tier B extension:* Restore `G8_SPLICE`/`DEPTH_N`/`EMBG_EN` defaults and hook `axi4_mem_slave.sv` onto `m_axi_g8`/`m_axi_g8b`/`m_axi_emb`/`m_axi_embb`.
+- [x] Editable GEMV demo: `make sim MODE=gemv-demo` runs the annotated
+      35-byte listing in `sim_local/tb/gemv_demo_program.hex` through the
+      real case-A fixture; see `GEMV_WALKTHROUGH.md`.
 
 ## Known RTL Gaps
 
