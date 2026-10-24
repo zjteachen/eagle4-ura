@@ -51,7 +51,9 @@ module tb_eagle4_drafter #(
     // Directed D1 seam timing overrides for variant smoke tests.
     parameter bit TEST_D1_RDLAT = 1'b1,
     parameter bit TEST_D1_WLAT  = 1'b1,
-    parameter bit TEST_BACK_SEQ = 1'b1
+    parameter bit TEST_BACK_SEQ = 1'b1,
+    parameter bit TEST_DUAL_PORT = 1'b0,
+    parameter bit TEST_CONNECT_SEAMS = 1'b0
 );
     import eagle4_regmap_pkg::*;
 
@@ -142,6 +144,8 @@ module tb_eagle4_drafter #(
         .D1_RDLAT (TEST_D1_RDLAT),
         .D1_WLAT  (TEST_D1_WLAT),
         .BACK_SEQ (TEST_BACK_SEQ),
+        .DUAL_PORT (TEST_DUAL_PORT),
+        .CONNECT_SEAMS (TEST_CONNECT_SEAMS),
         .LMDOWN_MEM_DIR_P(LMDOWN_DIR)
     ) dut (
         .ap_clk  (ap_clk),
@@ -693,6 +697,10 @@ module tb_eagle4_drafter #(
             repeat (500_000) @(posedge ap_clk);
             $fatal(1, "ACK-only: global watchdog expired");
         end
+        if ($test$plusargs("GEMV_DUAL_R1")) begin
+            repeat (2_000_000) @(posedge ap_clk);
+            $fatal(1, "DUAL-R1: global watchdog expired");
+        end
     end
 
 
@@ -905,6 +913,37 @@ module tb_eagle4_drafter #(
             $fatal(1, "GEMV: expected HALT at PC=%0d, got %08x", halt_pc, rd);
     endtask
 
+    bit r1_capture = 1'b0;
+    int r1e_wr_n = 0, r1h_wr_n = 0;
+    logic signed [16*16-1:0] r1_cap_e191, r1_cap_h0, r1_cap_h1, r1_cap_h2;
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && r1_capture) begin
+            if (dut.g_seam_r1_fullw.r1f_e_wr) begin
+                if (r1e_wr_n == 191) r1_cap_e191 <= dut.g_seam_r1_fullw.r1f_e_wr_chunk;
+                r1e_wr_n <= r1e_wr_n + 1;
+            end
+            if (dut.g_seam_r1_fullw.r1f_h_wr) begin
+                if (r1h_wr_n == 0) r1_cap_h0 <= dut.g_seam_r1_fullw.r1f_h_wr_chunk;
+                if (r1h_wr_n == 1) r1_cap_h1 <= dut.g_seam_r1_fullw.r1f_h_wr_chunk;
+                if (r1h_wr_n == 2) r1_cap_h2 <= dut.g_seam_r1_fullw.r1f_h_wr_chunk;
+                r1h_wr_n <= r1h_wr_n + 1;
+            end
+        end
+    end
+
+    bit dual_watch = 1'b0;
+    int dual_n = 0;
+    logic [15:0] dual_idx [0:7];
+    logic signed [16*16-1:0] dual_a [0:7], dual_b [0:7];
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && dual_watch && dut.array_chunk_idx_valid && dual_n < 8) begin
+            dual_idx[dual_n] <= dut.array_chunk_idx_out;
+            dual_a[dual_n]   <= dut.a_chunk_mux;
+            dual_b[dual_n]   <= dut.a_chunk_b_mux;
+            dual_n <= dual_n + 1;
+        end
+    end
+
     bit ack_watch = 1'b0;
     int ack_r2_writes = 0, ack_r4_writes = 0;
     bit ack_r2_seen = 1'b0, ack_r4_seen = 1'b0;
@@ -988,6 +1027,93 @@ module tb_eagle4_drafter #(
             $fatal(1, "ACK R4: writes=%0d seen=%0d early_done=%0d", ack_r4_writes, ack_r4_seen, ack_early);
         $display("[%0t] PASS ACK R4: 8 subchunk writes, op_done only after final ack", $time);
         $display("[%0t] PASS: serializer-ack ordering under BACK_SEQ=%0d", $time, TEST_BACK_SEQ);
+    endtask
+
+    task automatic run_gemv_dual_r1();
+        logic [31:0] st;
+        logic signed [15:0] lo, hi;
+        int lane, raw, waddr;
+        logic [31:0] w;
+        longint esum;
+        int i;
+        $display("[%0t] ---- dual-port R1 crossing 191/192 (real G1 producer) ----", $time);
+        // Fill real R1: unity gammas + deterministic EMB/HFC vectors.
+        axil_write(ADDR_HFC_SELECT, 0); axil_write(ADDR_EMB_SELECT, 0);
+        axil_write(ADDR_GAMMA_SEL, GAMMA_HIDDEN_NORM);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        repeat (GAMMA_WORDS) axil_write(ADDR_BOOT_WR_DATA, 32'h1000_1000);
+        axil_write(ADDR_GAMMA_SEL, GAMMA_E_NORM);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        repeat (GAMMA_WORDS) axil_write(ADDR_BOOT_WR_DATA, 32'h1000_1000);
+        axil_write(ADDR_GAMMA_SEL, 0);
+        axil_write(ADDR_EMB_SELECT, 1);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        for (i = 0; i < WORDS_PER_VECTOR; i = i + 1) begin
+            lo = 16'(((7*i + 3) % 17) - 8);
+            hi = 16'(((7*i + 10) % 17) - 8);
+            axil_write(ADDR_BOOT_WR_DATA, {hi, lo});
+        end
+        axil_write(ADDR_EMB_SELECT, 0);
+        axil_write(ADDR_HFC_SELECT, 1);
+        axil_write(ADDR_BOOT_WR_ADDR, 0);
+        for (i = 0; i < WORDS_PER_VECTOR; i = i + 1) begin
+            lo = 16'(((5*i + 2) % 13) - 6);
+            hi = 16'(((5*i + 8) % 13) - 6);
+            axil_write(ADDR_BOOT_WR_DATA, {hi, lo});
+        end
+        axil_write(ADDR_HFC_SELECT, 0);
+
+        // G1; then src3 base191 cpt4 cpg4 into Q. Weights select input
+        // element lane%16 (+1) in each of the four chunks; scale=1.0 Q13.
+        gv_reset();
+        gv_byte(8'h01);
+        gv_config(191, 4000, 1, 4, 4, 0, 200, 3, 0, 13);
+        gv_byte(8'h80); gv_byte(8'h40);
+        boot_we = 1'b1;
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            boot_lane_sel = lane[15:0];
+            for (int q = 0; q < 4; q = q + 1) begin
+                // raw 2 decodes to 0 (qzero+1=2); raw 3 decodes to +1.
+                w = 32'hAAAA_AAAA;               // all 16 codes = raw 2 -> weight 0
+                w[(lane % 16)*2 +: 2] = 2'b11;   // selected element -> weight +1
+                waddr = 4000 + q;
+                boot_wr_addr = waddr[16:0];
+                boot_wr_data = w;
+                @(posedge ap_clk);
+            end
+        end
+        boot_we = 1'b0; @(posedge ap_clk);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            gv_load_scale(200, lane, 8192);
+        tb_sc_we = 1'b0;
+
+        gv_begin_run(st);
+        r1e_wr_n = 0; r1h_wr_n = 0; r1_capture = 1'b1;
+        dual_n = 0; dual_watch = 1'b1;
+        gv_wait_op(st);
+        dual_watch = 1'b0; r1_capture = 1'b0;
+        for (i = 0; i < dual_n; i = i + 1)
+            $display("DUALDBG i=%0d idx=%0d A0=%0d B0=%0d", i, dual_idx[i],
+                     $signed(dual_a[i][0 +: 16]), $signed(dual_b[i][0 +: 16]));
+        $display("DUALDBG cap e191[0]=%0d h0[0]=%0d h1[0]=%0d h2[0]=%0d",
+                 $signed(r1_cap_e191[0 +: 16]), $signed(r1_cap_h0[0 +: 16]),
+                 $signed(r1_cap_h1[0 +: 16]), $signed(r1_cap_h2[0 +: 16]));
+        if (!st[1] || st[2] || st[0]) $fatal(1, "DUAL R1: bad status %08x", st);
+        if (r1e_wr_n < 192 || r1h_wr_n < 192)
+            $fatal(1, "DUAL R1: producer writes e=%0d h=%0d", r1e_wr_n, r1h_wr_n);
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            i = lane % 16;
+            esum = longint'($signed(r1_cap_e191[i*16 +: 16])) +
+                   longint'($signed(r1_cap_h0[i*16 +: 16])) +
+                   longint'($signed(r1_cap_h1[i*16 +: 16])) +
+                   longint'($signed(r1_cap_h2[i*16 +: 16]));
+            if ($signed(dut.q_full_buf[0][lane*32 +: 32]) !== 32'(esum))
+                $fatal(1, "DUAL R1: lane%0d actual=%0d expected=%0d (e191=%0d h0=%0d h1=%0d h2=%0d)",
+                       lane, $signed(dut.q_full_buf[0][lane*32 +: 32]), esum,
+                       $signed(r1_cap_e191[i*16 +: 16]), $signed(r1_cap_h0[i*16 +: 16]),
+                       $signed(r1_cap_h1[i*16 +: 16]), $signed(r1_cap_h2[i*16 +: 16]));
+        end
+        $display("[%0t] PASS DUAL R1: base191/cpt4 consumed e191 + h0 + h1 + h2, all 128 lanes match", $time);
     endtask
 
     task automatic run_gemv_only();
@@ -1425,6 +1551,12 @@ module tb_eagle4_drafter #(
 
         if ($test$plusargs("GEMV_ACK_ONLY")) begin
             run_gemv_ack_only();
+            $finish;
+            disable main_sequence;
+        end
+
+        if ($test$plusargs("GEMV_DUAL_R1")) begin
+            run_gemv_dual_r1();
             $finish;
             disable main_sequence;
         end
