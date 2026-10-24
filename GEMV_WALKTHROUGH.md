@@ -90,9 +90,14 @@ PC  bytes       field
 ```
 
 `r9` is `{2'b0, activation_source[2:0], output_destination[3:0],
-qzero_raw[1:0], scale_frac[4:0]}`. The fixture drives source 1 (HFC) and a
-destination of 0/1/2/9; the controller validates the numeric fields and the
-selected source/destination spans before launching any lane.
+qzero_raw[1:0], scale_frac[4:0]}`. This fixed case-A fixture/oracle validates
+only the default QKV destination 9 and the safe Q destination 0 edit:
+`gv_check_case_a_outputs` always reads `q_full_buf[0]`, and the source, bases,
+and dimensions stay fixed for the numeric demo. Other valid destination edits
+may execute on the real engine but will fail these fixture expectations; that
+is a demo-fixture mismatch, not an engine failure. The controller still
+validates the numeric fields and selected source/destination spans before
+launching any lane.
 
 The 35 bytes become 9 PMEM words; the unused fourth byte of the last word is
 padded with `0x40` (`HALT`). For example, word 0 is `0x6100_0060`
