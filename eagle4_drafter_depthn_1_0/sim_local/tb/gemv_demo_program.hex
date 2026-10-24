@@ -1,0 +1,38 @@
+// GEMV demo program: exactly 11 explicit WRSR instructions, one GEMV, HALT.
+// The testbench reads this file at run time; no RTL rebuild is needed.
+//
+// Format: exactly two hex digits per byte token. Whitespace is ignored;
+// // or # starts a comment through end-of-line. Bytes are packed
+// little-endian into 32-bit PMEM words (byte 0 -> bits 7:0).
+//
+// PC  bytes       field
+//  0  60 00 00    WRSR r0  activation_base = 0 (HFC source, chunk 0)
+//  3  61 00 00    WRSR r1  weight_base[15:0] = 0
+//  6  62 01 00    WRSR r2  tile_count = 1 (one 128-row output tile)
+//  9  63 08 00    WRSR r3  chunks_per_tile = 8 (8 x 16 = 128 inputs)
+// 12  64 08 00    WRSR r4  chunks_per_scale_group = 8 (one scale group)
+// 15  65 00 00    WRSR r5  output_base = 0 (first destination tile)
+// 18  66 00 00    WRSR r6  weight_base[16] = 0
+// 21  67 00 00    WRSR r7  scale_base[15:0] = 0
+// 24  68 00 00    WRSR r8  scale_base[16] = 0
+// 27  69 AD 0C    WRSR r9  = 0x0CAD: src=1 (HFC), dest=9 (QKV), qzero_raw=1, frac=13
+// 30  6A 00 00    WRSR r10 output_conversion = 0 (destination-fixed conversion)
+// 33  80          GEMV: run the latched configuration
+// 34  40          HALT: freeze the PC here
+//
+// Safe edit for the walkthrough: change r9's immediate to 0x082D
+// (69 2D 08) to route to destination 0 (Q) instead of QKV composite.
+// The first tile still lands in q_full_buf[0], so the observed values match.
+60 00 00
+61 00 00
+62 01 00
+63 08 00
+64 08 00
+65 00 00
+66 00 00
+67 00 00
+68 00 00
+69 AD 0C
+6A 00 00
+80
+40

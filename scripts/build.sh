@@ -5,8 +5,8 @@
 #   ./scripts/build.sh lint  [TOP]                 - Verilator lint/elab
 #                                                     (works in this env,
 #                                                     no Vivado needed)
-#   ./scripts/build.sh sim   [fast|g1|regs]           - Tier A end-to-end smoke
-#                                                     test (random I/O, real
+#   ./scripts/build.sh sim   [fast|g1|regs|gemv|gemv-demo] - Tier A end-to-end
+#                                                     smoke test (random I/O, real
 #                                                     RTL, Verilator --binary).
 #                                                     "fast" = tiny weight/
 #                                                     scale depth, harness
@@ -17,10 +17,15 @@
 #                                                     "regs" = WRSR ->
 #                                                     special_regs AXI
 #                                                     readback (no loads).
+#                                                     "gemv" = bounded real
+#                                                     shared-GEMV regression.
+#                                                     "gemv-demo" = editable
+#                                                     PMEM program + case-A
+#                                                     demo (paths printed).
 #                                                     No arg = full hardware-
 #                                                     scale depth (slow, ~tens
 #                                                     of minutes -- see
-#                                                     sim_local/tb/README).
+#                                                     BUILD.md).
 #   ./scripts/build.sh synth [PART] [TOP] [PERIOD] - Vivado OOC synth
 #                                                     check (needs Vivado
 #                                                     + license on PATH)

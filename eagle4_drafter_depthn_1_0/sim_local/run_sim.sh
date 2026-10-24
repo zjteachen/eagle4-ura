@@ -11,6 +11,15 @@
 #   ./run_sim.sh gemv         # bounded real shared-GEMV cutover: HFC/EMB ->
 #                              #   QKV/Q/K destinations, runtime groups 4/8,
 #                              #   nonzero bases, invalid-config/restart
+#   ./run_sim.sh gemv-demo    # editable 35-byte PMEM program from
+#                              #   tb/gemv_demo_program.hex; prints PMEM
+#                              #   words, special-register AXI readbacks,
+#                              #   status, and checks all 128 outputs.
+#                              #   Extra args go to the sim binary, e.g.
+#                              #   +GEMV_DEMO_PROG=/tmp/edited.hex. For file
+#                              #   edits without a rebuild, run the built
+#                              #   binary directly:
+#                              #     obj_dir_sim/sim_tb +GEMV_DEMO
 #   ./run_sim.sh              # full depth: real WEIGHT/SCALE bank sizes
 #                              #   (~14.7M direct-drive pokes -- slow, but
 #                              #   the true load, matching real hardware)
@@ -28,16 +37,23 @@ BUILD_DIR="obj_dir_sim"
 
 DEPTH_ARGS=()
 SIM_ARGS=()
-if [[ "${1:-}" == "fast" ]]; then
-    echo "== fast mode: TEST_WEIGHT_DEPTH=8 TEST_SCALE_DEPTH=8 (harness sanity only) =="
-    DEPTH_ARGS=(-GTEST_WEIGHT_DEPTH=8 -GTEST_SCALE_DEPTH=8)
-elif [[ "${1:-}" == "g1" ]]; then
-    SIM_ARGS=(+G1_ONLY)
-elif [[ "${1:-}" == "regs" ]]; then
-    SIM_ARGS=(+REGS_ONLY)
-elif [[ "${1:-}" == "gemv" ]]; then
-    SIM_ARGS=(+GEMV_ONLY)
-fi
+MODE="${1:-}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$MODE" in
+    fast)
+        echo "== fast mode: TEST_WEIGHT_DEPTH=8 TEST_SCALE_DEPTH=8 (harness sanity only) =="
+        DEPTH_ARGS=(-GTEST_WEIGHT_DEPTH=8 -GTEST_SCALE_DEPTH=8)
+        ;;
+    g1)        SIM_ARGS=(+G1_ONLY) ;;
+    regs)      SIM_ARGS=(+REGS_ONLY) ;;
+    gemv)      SIM_ARGS=(+GEMV_ONLY) ;;
+    gemv-demo) SIM_ARGS=(+GEMV_DEMO) ;;
+    "")        ;;
+    *)
+        echo "error: unknown sim mode '$MODE' (use fast, g1, regs, gemv, or gemv-demo)" >&2
+        exit 1
+        ;;
+esac
 
 verilator --binary --timing -Wno-fatal \
     +incdir+"$SRC_DIR" \
@@ -48,8 +64,9 @@ verilator --binary --timing -Wno-fatal \
     tb/tb_eagle4_drafter.sv \
     --top-module tb_eagle4_drafter \
     -GLMDOWN_DIR=\""$SRC_DIR"\" \
+    -GGEMV_DEMO_PROG_PATH=\""$PWD/tb/gemv_demo_program.hex\"" \
     "${DEPTH_ARGS[@]}" \
     -Mdir "$BUILD_DIR" \
     -o sim_tb
 
-"$BUILD_DIR/sim_tb" "${SIM_ARGS[@]}"
+"$BUILD_DIR/sim_tb" "${SIM_ARGS[@]}" "$@"

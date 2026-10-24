@@ -40,6 +40,9 @@
 
 module tb_eagle4_drafter #(
     parameter string LMDOWN_DIR = "",  // absolute path to src/ (holding lmdown_W_q15_laneN.mem); set via -G from run_sim.sh
+    // Default GEMV demo program, read at runtime. run_sim.sh passes an
+    // absolute path; +GEMV_DEMO_PROG=<file> overrides it without a rebuild.
+    parameter string GEMV_DEMO_PROG_PATH = "tb/gemv_demo_program.hex",
     // Full WEIGHT/SCALE depth is ~14.7M direct-drive pokes (real hardware
     // size). For fast iteration while debugging the harness itself,
     // run_sim.sh can override these down to a handful of words per lane via
@@ -693,6 +696,10 @@ module tb_eagle4_drafter #(
             repeat (2_000_000) @(posedge ap_clk);
             $fatal(1, "GEMV-only: global watchdog expired");
         end
+        if ($test$plusargs("GEMV_DEMO")) begin
+            repeat (2_000_000) @(posedge ap_clk);
+            $fatal(1, "GEMV-demo: global watchdog expired");
+        end
         if ($test$plusargs("GEMV_ACK_ONLY")) begin
             repeat (500_000) @(posedge ap_clk);
             $fatal(1, "ACK-only: global watchdog expired");
@@ -892,6 +899,39 @@ module tb_eagle4_drafter #(
         end
     endtask
 
+    // Case-A fixture, shared by the full regression and the editable demo:
+    // deterministic HFC activation over AXI, packed 2-bit weights and
+    // per-lane scales over the simulation-only direct pins, plus the probe
+    // stage view. The checker below is the same independent integer oracle
+    // used for every destination lane in case A.
+    task automatic gv_load_case_a_fixture();
+        int lane;
+        axil_write(ADDR_HFC_SELECT, 1);
+        gv_load_vector(1'b0, 0, 10);
+        axil_write(ADDR_HFC_SELECT, 0);
+        gv_load_weights(0, 0, 0, 0, 8);
+        for (lane = 0; lane < LANES; lane = lane + 1)
+            gv_load_scale(0, lane, gemv_scale0(lane));
+        tb_sc_we = 1'b0;
+        axil_write(0'ha8, 1);           // probe stage view 0 (QKV/Q/K/V)
+    endtask
+
+    task automatic gv_check_case_a_outputs(input string tag, input bit show_first);
+        int lane, actual, expected;
+        for (lane = 0; lane < LANES; lane = lane + 1) begin
+            actual = $signed(dut.q_full_buf[0][lane*32 +: 32]);
+            expected = gemv_oracle(0, lane, 0, 0, 8, 8, gemv_scale0(lane), 0);
+            if (show_first && lane < 4)
+                $display("[%0t] %s lane %0d: actual=%0d expected=%0d",
+                         $time, tag, lane, actual, expected);
+            if (actual !== expected)
+                $fatal(1, "%s: lane %0d Q actual=%0d expected=%0d",
+                       tag, lane, actual, expected);
+        end
+        $display("[%0t] %s: all %0d destination lanes match the case-A oracle",
+                 $time, tag, LANES);
+    endtask
+
     task automatic gv_wait_op(output logic [31:0] status);
         logic [31:0] ap;
         int n;
@@ -912,6 +952,129 @@ module tb_eagle4_drafter #(
         if (rd[31:16] !== 16'h504D || rd[14:8] !== 7'(halt_pc) || rd[7:0] !== 8'h40)
             $fatal(1, "GEMV: expected HALT at PC=%0d, got %08x", halt_pc, rd);
     endtask
+
+    // ================================================================
+    // Editable GEMV demo program loader.
+    //
+    // The file is a byte-oriented hex listing: exactly two hex digits per
+    // token, whitespace ignored, // or # starts a comment to end-of-line.
+    // It is parsed into gv_prog and then uploaded through the same AXI PMEM
+    // path as every other program. This is deliberately a small validator,
+    // not a general assembler: it accepts only the fixed demo shape
+    // (11 WRSR + GEMV + HALT) so a stale/default program cannot slip
+    // through unnoticed.
+    // ================================================================
+    localparam int GEMV_DEMO_BYTES = 35;
+
+    function automatic int gv_hex_nibble(input int c);
+        if (c >= 48 && c <= 57)  return c - 48;        // 0-9
+        if (c >= 65 && c <= 70)  return c - 55;        // A-F
+        if (c >= 97 && c <= 102) return c - 87;        // a-f
+        return -1;
+    endfunction
+
+    task automatic gv_parser_emit(input string path, input int line,
+                                  input int nd, input int value);
+        if (nd != 2)
+            $fatal(1, "GEMV DEMO: %s:%0d: expected exactly two hex digits, got %0d",
+                   path, line, nd);
+        if (gv_nb >= 128)
+            $fatal(1, "GEMV DEMO: %s: program exceeds the 128-byte PMEM", path);
+        gv_prog[gv_nb] = 8'(value);
+        gv_nb = gv_nb + 1;
+    endtask
+
+    task automatic gv_parse_program_file(input string path);
+        int fd, c, d, line, nd, value;
+        bit in_token;
+        gv_reset();
+        line = 1; nd = 0; value = 0; in_token = 1'b0;
+        fd = $fopen(path, "r");
+        if (fd == 0)
+            $fatal(1, "GEMV DEMO: cannot open '%s' (pass +GEMV_DEMO_PROG=<path> or create the default file)",
+                   path);
+        forever begin
+            c = $fgetc(fd);
+            if (c == -1) break;
+            if (c == 10) begin
+                if (in_token) begin
+                    gv_parser_emit(path, line, nd, value);
+                    in_token = 1'b0;
+                end
+                line = line + 1;
+            end else if (c == 13 || c == 9 || c == 32) begin
+                if (in_token) begin
+                    gv_parser_emit(path, line, nd, value);
+                    in_token = 1'b0;
+                end
+            end else if (c == 35) begin               // '#'
+                if (in_token) begin
+                    gv_parser_emit(path, line, nd, value);
+                    in_token = 1'b0;
+                end
+                while (1) begin
+                    c = $fgetc(fd);
+                    if (c == -1 || c == 10) break;
+                end
+                if (c == 10) line = line + 1;
+            end else if (c == 47) begin               // '/'
+                if (in_token) begin
+                    gv_parser_emit(path, line, nd, value);
+                    in_token = 1'b0;
+                end
+                c = $fgetc(fd);
+                if (c != 47)
+                    $fatal(1, "GEMV DEMO: %s:%0d: unexpected '/'; comments start with // or #",
+                           path, line);
+                while (1) begin
+                    c = $fgetc(fd);
+                    if (c == -1 || c == 10) break;
+                end
+                if (c == 10) line = line + 1;
+            end else begin
+                d = gv_hex_nibble(c);
+                if (d < 0)
+                    $fatal(1, "GEMV DEMO: %s:%0d: non-hex character 0x%02x",
+                           path, line, c);
+                if (!in_token) begin
+                    in_token = 1'b1;
+                    nd = 0;
+                    value = 0;
+                end
+                nd = nd + 1;
+                value = value*16 + d;
+                if (nd > 2)
+                    $fatal(1, "GEMV DEMO: %s:%0d: hex token is longer than two digits",
+                           path, line);
+            end
+        end
+        if (in_token) gv_parser_emit(path, line, nd, value);
+        $fclose(fd);
+        if (gv_nb == 0)
+            $fatal(1, "GEMV DEMO: %s: no program bytes found", path);
+        $display("[%0t] loaded %0d program bytes from %s", $time, gv_nb, path);
+    endtask
+
+    task automatic gv_validate_demo_program(input string path);
+        if (gv_nb != GEMV_DEMO_BYTES)
+            $fatal(1, "GEMV DEMO: %s: expected %0d bytes (11 WRSR + GEMV + HALT), got %0d",
+                   path, GEMV_DEMO_BYTES, gv_nb);
+        for (int i = 0; i < 11; i = i + 1) begin
+            if (gv_prog[3*i] !== (8'h60 | 8'(i)))
+                $fatal(1, "GEMV DEMO: %s: byte %0d is 0x%02x, expected WRSR r%0d (0x%02x)",
+                       path, 3*i, gv_prog[3*i], i, 8'h60 | 8'(i));
+        end
+        if (gv_prog[33] !== 8'h80)
+            $fatal(1, "GEMV DEMO: %s: byte 33 is 0x%02x, expected GEMV 0x80",
+                   path, gv_prog[33]);
+        if (gv_prog[34] !== 8'h40)
+            $fatal(1, "GEMV DEMO: %s: byte 34 is 0x%02x, expected HALT 0x40",
+                   path, gv_prog[34]);
+    endtask
+
+    function automatic logic [15:0] gv_program_reg(input int r);
+        return {gv_prog[3*r + 2], gv_prog[3*r + 1]};
+    endfunction
 
     bit r1_capture = 1'b0;
     int r1e_wr_n = 0, r1h_wr_n = 0;
@@ -970,6 +1133,69 @@ module tb_eagle4_drafter #(
         gv_starts = 0; gv_tiles = 0; gv_errors = 0;
         gv_upload(status);
         gv_watch = 1'b1;
+    endtask
+
+    // Editable end-to-end demo: parse a runtime hex file, upload it through
+    // the real AXI PMEM mailbox, run the real case-A GEMV fixture, and show
+    // the same actual-vs-oracle data the full regression checks.
+    task automatic run_gemv_demo();
+        logic [31:0] st, rd, tile_rd;
+        string path;
+        int nw, committed;
+
+        $display("[%0t] ---- editable GEMV demo (real top, AXI PMEM, case-A fixture) ----", $time);
+        if (!$value$plusargs("GEMV_DEMO_PROG=%s", path))
+            path = GEMV_DEMO_PROG_PATH;
+        $display("[%0t] program file: %s", $time, path);
+        gv_parse_program_file(path);
+        gv_validate_demo_program(path);
+        nw = (gv_nb + 3) / 4;
+        $display("[%0t] program length: %0d bytes -> %0d PMEM words (32-word / 128-byte PMEM)",
+                 $time, gv_nb, nw);
+        for (int i = 0; i < 11; i = i + 1)
+            $display("[%0t]   WRSR r%0d immediate = 0x%04x", $time, i, gv_program_reg(i));
+        $display("[%0t]   r9 decode: activation_source=%0d output_destination=%0d qzero_raw=%0d scale_frac=%0d",
+                 $time, gv_program_reg(9)[13:11], gv_program_reg(9)[10:7],
+                 gv_program_reg(9)[6:5], gv_program_reg(9)[4:0]);
+
+        gv_load_case_a_fixture();
+        gv_begin_run(st);
+        axil_read(ADDR_PMEM_ADDR, committed);
+        if (committed !== nw)
+            $fatal(1, "GEMV DEMO: PMEM committed %0d/%0d words", committed, nw);
+        $display("[%0t] PMEM upload committed: %0d words; pre-start PMEM status=0x%08x",
+                 $time, committed, st);
+
+        gv_wait_op(st);
+        axil_read(ADDR_GEMV_TILE, tile_rd);
+        for (int i = 0; i < 11; i = i + 1) begin
+            sr_read_reg(5'(i), rd);
+            $display("[%0t]   r%0d AXI readback = 0x%04x (program 0x%04x)",
+                     $time, i, rd[15:0], gv_program_reg(i));
+            if (rd[31:16] !== 16'h5A5A || rd[15:0] !== gv_program_reg(i))
+                $fatal(1, "GEMV DEMO: r%0d readback 0x%08x, expected 0x5A5A%04x",
+                       i, rd, gv_program_reg(i));
+        end
+        $display("[%0t] GEMV status 0x%08x: BUSY=%0d DONE=%0d ERROR=%0d; last tile=%0d; starts=%0d tiles=%0d errors=%0d",
+                 $time, st, st[0], st[1], st[2], tile_rd[15:0],
+                 gv_starts, gv_tiles, gv_errors);
+
+        if (st[2]) begin
+            axil_read(ADDR_PMEM_DATA, rd);
+            $display("[%0t] DEMO RESULT: ERROR (BUSY=%0d DONE=%0d ERROR=%0d); PMEM status=0x%08x; starts=%0d tiles=%0d",
+                     $time, st[0], st[1], st[2], rd, gv_starts, gv_tiles);
+            $fatal(1, "GEMV DEMO: configuration ERROR; the documented invalid-cpg edit is expected to stop here, no PASS claimed");
+        end
+        if (st[0] || !st[1])
+            $fatal(1, "GEMV DEMO: expected BUSY=0 DONE=1 ERROR=0, got 0x%08x", st);
+        if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
+            $fatal(1, "GEMV DEMO: starts=%0d tiles=%0d errors=%0d (expected 1/1/0)",
+                   gv_starts, gv_tiles, gv_errors);
+        gv_check_pc(gv_nb - 1);
+
+        gv_check_case_a_outputs("GEMV DEMO", 1'b1);
+        $display("[%0t] PASS GEMV DEMO: %0d bytes/%0d PMEM words, HALT at PC=%0d, status DONE, no ERROR, all 128 lanes checked.",
+                 $time, gv_nb, nw, gv_nb - 1);
     endtask
 
     task automatic run_gemv_ack_only();
@@ -1106,14 +1332,7 @@ module tb_eagle4_drafter #(
         gv_reset();
         gv_config(0, 0, 1, 8, 8, 0, 0, 1, 9, 13);
         gv_byte(8'h80); gv_byte(8'h40);
-        axil_write(ADDR_HFC_SELECT, 1);
-        gv_load_vector(1'b0, 0, 10);
-        axil_write(ADDR_HFC_SELECT, 0);
-        gv_load_weights(0, 0, 0, 0, 8);
-        for (lane = 0; lane < LANES; lane = lane + 1)
-            gv_load_scale(0, lane, gemv_scale0(lane));
-        tb_sc_we = 1'b0;
-        axil_write(0'ha8, 1);           // probe stage view 0 (QKV/Q/K/V)
+        gv_load_case_a_fixture();
         gv_begin_run(st);
         gv_wait_op(st);
         if (!st[1] || st[2] || st[0]) begin
@@ -1127,12 +1346,7 @@ module tb_eagle4_drafter #(
         gv_check_pc(gv_nb - 1);
         if (gv_starts != 1 || gv_tiles != 1 || gv_errors != 0)
             $fatal(1, "GEMV A: starts=%0d tiles=%0d errors=%0d", gv_starts, gv_tiles, gv_errors);
-        // Per-lane scales differ, so re-check each lane's actual scale:
-        for (lane = 0; lane < LANES; lane = lane + 1) begin
-            if ($signed(dut.q_full_buf[0][lane*32 +: 32]) !==
-                32'(gemv_oracle(0, lane, 0, 0, 8, 8, gemv_scale0(lane), 0)))
-                $fatal(1, "GEMV A: lane %0d Q mismatch", lane);
-        end
+        gv_check_case_a_outputs("GEMV A", 1'b0);
         // Probe check with per-lane scales:
         for (lane = 0; lane < LANES; lane = lane + 1) begin
             logic [31:0] prd;
@@ -1519,6 +1733,12 @@ module tb_eagle4_drafter #(
 
         if ($test$plusargs("REGS_ONLY")) begin
             run_regs_only();
+            $finish;
+            disable main_sequence;
+        end
+
+        if ($test$plusargs("GEMV_DEMO")) begin
+            run_gemv_demo();
             $finish;
             disable main_sequence;
         end
