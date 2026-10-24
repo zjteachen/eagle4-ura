@@ -117,7 +117,9 @@ pulses the ISA error termination so the PC advances to the next instruction
 - `0x170` R: bit0 BUSY, bit1 sticky DONE, bit2 sticky ERROR.
 - `0x174` R: active/last engine tile index.
 - DONE is asserted only after the destination adapter reports the final
-  store/serialize complete; TREE streaming completion remains `tree_done`.
+  store/serialize complete. A TREE session keeps BUSY high across the whole
+  walk and streaming drain, and latches sticky DONE on the explicit
+  `tree_done` session-completion handshake.
 - `0x178` W/R: bank read selector; `0x17C` R: `{16'h5A5A, read_data}`.
 
 ## State IDs
@@ -128,7 +130,11 @@ The former shared-stage operands G4=`2`, G6=`4`, G7G=`5`, G7U=`6`,
 G9=`8`, and G12=`10` are retired: the fetcher decodes them as HALT, and
 their engine work is now expressed by GEMV instructions. G12 is no longer a
 standalone program step: TREE is the sole G12 client and drives the same
-configured engine tile-by-tile with its own stream backpressure.
+configured engine tile-by-tile with its own stream backpressure. The TREE
+scan length is the actual ISA `tile_count`, launch-sampled by the tiler and
+validated to 1..1002 (physical TREE capacity) plus the weight/scale spans.
+The legacy AXI `0x14C n_tiles_cfg` register is host-readable only and has NO
+effect on shared execution.
 
 `COMPONENTS.md` "ISA State Encodings & Instruction Set" has the full
 historical state table.
