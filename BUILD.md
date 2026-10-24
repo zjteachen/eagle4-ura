@@ -8,6 +8,7 @@ All targets wrap `scripts/build.sh`.
 make lint                 # Verilator lint & elaborate eagle4_drafter
 make lint TOP=<module>    # Lint specific submodule
 make sim MODE=g1          # Isolated ISA test: STATE G1; HALT (no weight load)
+make sim MODE=regs        # ISA WRSR -> special_regs AXI readback (no loads)
 make sim MODE=fast        # Fast smoke test (~30s, depth=8, sanity only)
 make sim                  # Full smoke test (hardware depth, tens of minutes)
 make synth                # Vivado OOC synthesis (default: V80, 100 MHz; requires Vivado)
@@ -26,9 +27,14 @@ Lints and elaborates SystemVerilog RTL (`eagle4_drafter_depthn_1_0/src/*.sv`) lo
 
 Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`) compiles with `verilator --binary`. Validates I/O plumbing, load paths, control flow, and `OUT_ABI_V24` frontier formatting. Does not evaluate numerical accuracy.
 
-- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast|g1]`
+- **Direct script**: `eagle4_drafter_depthn_1_0/sim_local/run_sim.sh [fast|g1|regs]`
   - `fast`: sets `TEST_WEIGHT_DEPTH=8` and `TEST_SCALE_DEPTH=8` (~30s).
   - Default: full hardware-scale depth (~14.7M pokes, tens of minutes).
+  - `regs`: uploads WRSR microprograms over AXI and exercises the actual
+    `special_regs` bank and its AXI readback with no WEIGHT/SCALE/activation
+    loads. Covers all 11 registers, word-crossing/unaligned immediates,
+    reserved addresses, restart, end-of-PMEM modulo wrap, reserved
+    opcode/JMP/HALT behavior, and a read/WRSR arbitration loop.
   - `g1`: uploads `STATE G1; HALT` through AXI-Lite, loads deterministic
     full-size hidden/embedding vectors and their two gamma vectors, and skips
     WEIGHT/SCALE loading. Checks one G1 launch, 192 ordered output chunks per
@@ -64,6 +70,7 @@ Non-project OOC synthesis via `scripts/synth/run_synth.tcl`. Requires Vivado on 
 
 1. Edit RTL.
 2. `make lint` — check syntax and elaboration.
-3. `make sim MODE=fast` — verify I/O, control flow, and output framing.
-4. `make sim` — run full hardware-depth smoke test before significant checkpoints.
-5. `make synth` — run on Vivado host to verify utilization and 100 MHz timing.
+3. `make sim MODE=regs` — check the ISA WRSR control path and bank readback.
+4. `make sim MODE=fast` — verify I/O, control flow, and output framing.
+5. `make sim` — run full hardware-depth smoke test before significant checkpoints.
+6. `make synth` — run on Vivado host to verify utilization and 100 MHz timing.

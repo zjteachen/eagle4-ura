@@ -348,7 +348,18 @@ programs out of a 32-word PMEM (128 bytes). Each instruction is one byte:
 | `000` | STATE | state ID (below) | Pulse the matching stage start; hold until that stage's done advances the PC |
 | `001` | JMP | PMEM word address (0..31) | `PC <- {operand, 2'b00}`; executes in one cycle, target must be word-aligned |
 | `010` | HALT | reserved (0) | Stop execution; one-cycle `halted` pulse (kernel done); PC stays at the HALT byte |
-| `011`-`111` | reserved | — | Decode as HALT (fail-safe stop; an under-programmed PMEM cannot free-run) |
+| `011` | WRSR | special-register address (0..10) | Three bytes: header `0x60\|addr`, immediate low byte, immediate high byte. Executes in one cycle: exactly one `special_regs` write, `PC += 3` |
+| `100`-`111` | reserved | — | Decode as HALT (fail-safe stop; an under-programmed PMEM cannot free-run) |
+
+WRSR immediates are little-endian. The two immediate bytes are fetched
+combinationally like every other instruction byte, so they may cross any
+32-bit PMEM word boundary. Byte addressing wraps modulo the 128-byte PMEM
+(existing policy): a WRSR at PC 126 reads its high immediate from byte 0 and
+leaves the next instruction at PC 1; a WRSR at PC 127 reads its high
+immediate from byte 0 and leaves the next instruction at PC 2. A `start_en`
+pulse in the same cycle as a WRSR wins (the bank write is suppressed along
+with the old PC). WRSR to addresses 11..31 is still one bank write strobe,
+but the bank ignores it (reserved writes do not change storage).
 
 The 5-bit STATE operand selects one of the 20 sequencer states below. The
 values reuse the `top_fsm` state enum numerically, so debug taps
@@ -396,6 +407,36 @@ the program is running are ignored by the fetcher (program between launches;
 a mid-run write would combinationaly corrupt the instruction under
 execution). Unwritten PMEM reads as HALT, so a program without a HALT traps
 instead of running off the end.
+
+### Special-register bank (`special_regs`)
+
+WRSR writes the 11 x 16-bit ISA special-register bank in
+`special_regs.sv`. Addresses 0..10 are implemented; 11..31 are reserved
+(writes ignored, reads return zero). The first six addresses preserve the
+original hands-on exercise contract.
+
+| Addr | Field | Meaning |
+| ---: | :--- | :--- |
+| 0 | `activation_base` | Starting activation chunk |
+| 1 | `weight_base[15:0]` | Per-lane weight-bank base (packed 32-bit words) |
+| 2 | `tile_count` | Number of output tiles in the operation |
+| 3 | `chunks_per_tile` | Activation/weight chunks per tile |
+| 4 | `chunks_per_scale_group` | Chunks sharing one scale entry |
+| 5 | `output_base` | First output tile within the destination buffer |
+| 6 | `weight_base[16]` | Bit 16 of the weight base (bits 15:1 reserved) |
+| 7 | `scale_base[15:0]` | Per-lane scale-bank base |
+| 8 | `scale_base[16]` | Bit 16 of the scale base (bits 15:1 reserved) |
+| 9 | packed config | `{2'b0, activation_source[2:0], output_destination[3:0], qzero_raw[1:0], scale_frac[4:0]}` |
+| 10 | `output_conversion` | Downstream store-conversion selector |
+
+The bank exposes decoded configuration outputs for the GEMV operation
+controller (latched at START in the follow-on integration task); register
+writes and validation of the numeric fields belong to the future engine, not
+this bank. Readback is through AXI: write the 5-bit bank address to `0x178`,
+then read `0x17C` for `{16'h5A5A, read_data}`. Reads use the bank's
+synchronous read port; `control_regs` waits for the bank's `read_ack` and
+retries when a concurrent WRSR write suppressed the bank read (write
+priority), so `0x17C` never silently returns stale data.
 ---
 
 ## Component Reference Encyclopedia
@@ -697,9 +738,9 @@ instead of running off the end.
 ---
 
 ### `instruction_fetcher`
-- **Source File:** `eagle4_drafter_depthn_1_0/src/instruction_fetcher.sv` (118 lines)
+- **Source File:** `eagle4_drafter_depthn_1_0/src/instruction_fetcher.sv` (171 lines)
 - **Construct Type:** `module`
-- **Technical Purpose:** Program-counter sequencer and PMEM holder for the ISA control flow. Fetches one 8-bit instruction per byte address combinationally (0-cycle fetch) from a 32-word distributed RAM, decodes the 3-bit opcode (STATE / JMP / HALT / reserved-as-HALT), executes word-aligned jumps autonomously, and tracks run/halt state for the kernel busy/done handshake. PMEM is programmed through the `control_regs` 0x168/0x16C aperture; the 5-bit STATE operand is the sequencer state ID (see *ISA State Encodings & Instruction Set* above).
+- **Technical Purpose:** Program-counter sequencer and PMEM holder for the ISA control flow. Fetches one instruction byte per byte address combinationally (0-cycle fetch) from a 32-word distributed RAM, decodes the 3-bit opcode (STATE / JMP / HALT / WRSR / reserved-as-HALT), executes word-aligned jumps and three-byte special-register writes autonomously, and tracks run/halt state for the kernel busy/done handshake. WRSR immediate bytes may cross PMEM word boundaries; byte addressing wraps modulo 128. PMEM is programmed through the `control_regs` 0x168/0x16C aperture; the 5-bit STATE operand is the sequencer state ID (see *ISA State Encodings & Instruction Set* above).
 
 **Parameters:** *(None)*
 
@@ -720,6 +761,48 @@ instead of running off the end.
 - **`is_state`** — level: current instruction is STATE and running
 - **`running`** — execution active (start_en .. HALT)
 - **`halted`** — 1-cycle pulse when HALT (or a reserved opcode) executes
+- **`sr_write_en`** — 1-cycle WRSR bank write strobe (exactly one per WRSR)
+- `[4:0]` **`sr_write_sel`** — WRSR register address (header bits 4:0)
+- `[15:0]` **`sr_write_data`** — WRSR immediate, little-endian byte order
+
+**Wiring & Hierarchy:**
+- **Instantiated By:** `eagle4_drafter` (`eagle4_drafter.sv`)
+- **Instantiates:** *(Leaf module)*
+
+---
+
+### `special_regs`
+- **Source File:** `eagle4_drafter_depthn_1_0/src/special_regs.sv` (97 lines)
+- **Construct Type:** `module`
+- **Technical Purpose:** ISA-written 11 x 16-bit execution-configuration bank. WRSR supplies the write port; an AXI debug read port returns the selected raw register through `control_regs` 0x178/0x17C. Decodes the raw registers into the activation/weight/scale bases, tile and chunk bounds, routing selectors, numeric fields, and output-conversion selector handed to the GEMV operation controller. Addresses 11..31 are reserved.
+
+**Parameters:** *(None)*
+
+**Port Interface:**
+
+*Inputs:*
+- **`clk`**
+- **`rst_en`** — active-low synchronous reset
+- **`write_en`**, `[4:0]` **`write_select`**, `[15:0]` **`write_data`** — ISA WRSR write port
+- **`read_en`**, `[4:0]` **`read_select`** — AXI debug read port
+
+*Outputs:*
+- `[15:0]` **`read_data`** — registered read data (holds when idle/suppressed)
+- **`read_ack`** — combinational read-commit indicator; low when a WRSR write suppresses the read
+- `[15:0]` **`activation_base`**
+- `[16:0]` **`weight_base`** — `{regs[6][0], regs[1]}`
+- `[15:0]` **`tile_count`**
+- `[15:0]` **`chunks_per_tile`**
+- `[15:0]` **`chunks_per_scale_group`**
+- `[15:0]` **`output_base`**
+- `[16:0]` **`scale_base`** — `{regs[8][0], regs[7]}`
+- `[2:0]` **`activation_source`**
+- `[3:0]` **`output_destination`**
+- `[1:0]` **`qzero_raw`**
+- `[4:0]` **`scale_frac`**
+- `[15:0]` **`output_conversion`**
+
+**Precedence:** reset > write > read. Any asserted write (including a reserved address) suppresses the read and holds `read_data`; reserved writes change no storage and reserved reads return zero.
 
 **Wiring & Hierarchy:**
 - **Instantiated By:** `eagle4_drafter` (`eagle4_drafter.sv`)
@@ -728,9 +811,9 @@ instead of running off the end.
 ---
 
 ### `control_regs`
-- **Source File:** `eagle4_drafter_depthn_1_0/src/control_regs.sv` (907 lines)
+- **Source File:** `eagle4_drafter_depthn_1_0/src/control_regs.sv` (993 lines)
 - **Construct Type:** `module`
-- **Technical Purpose:** Memory-mapped AXI4-Lite slave register file (4KB aperture). Decodes control and configuration registers: execution triggers (ap_start, ap_done), runtime hyperparameters (max_depth, k_live, kvonly_act), base addresses for DMA channels, and direct-drive memory access ports (boot_we, tb_sc_we, EMB/HFC/GAMMA register trios). Provides status polling and error flags to host.
+- **Technical Purpose:** Memory-mapped AXI4-Lite slave register file (4KB aperture). Decodes control and configuration registers: execution triggers (ap_start, ap_done), runtime hyperparameters (max_depth, k_live, kvonly_act), base addresses for DMA channels, direct-drive memory access ports (boot_we, tb_sc_we, EMB/HFC/GAMMA register trios), and the ISA PMEM mailbox/special-register debug window (0x168/0x16C/0x178/0x17C). Provides status polling and error flags to host.
 
 **Parameters:**
 | Name | Default Value | Type |
@@ -799,6 +882,8 @@ instead of running off the end.
 - `[31:0]` **`batch_b0_hi`**
 - `[31:0]` **`batch_sib_lo`**
 - `[31:0]` **`batch_sib_hi`**
+- `[15:0]` **`sr_read_data`** — special-register bank read data
+- **`sr_read_ack`** — bank read committed this cycle
 
 *Outputs:*
 - **`s_axi_control_awready`**
@@ -855,6 +940,8 @@ instead of running off the end.
 - `[2:0]` **`res_sel`**
 - **`res_clear`**
 - **`kv_res_clear`**
+- `[4:0]` **`sr_read_sel`** — special-register read selector (0x178)
+- **`sr_read_en`** — bank read request strobe
 - **`inj_en_we`**
 - `[31:0]` **`inj_en_wdata`**
 - **`inj_widx_we`**

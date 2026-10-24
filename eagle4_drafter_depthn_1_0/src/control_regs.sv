@@ -23,6 +23,11 @@
 //   0x40  hbm_emb_base[31:0]
 //   0x44  hbm_emb_base[63:32]
 //   0x78  (RO) out_dma_status  bit[0]=out_busy, bit[1]=out_done  (OUTPUT-DMA)
+//   0x168 W  PMEM write_addr pointer / R {24'b0, write_addr}
+//   0x16c W  PMEM write_data mailbox (auto-increments) / R {16'h504D, PC, instr}
+//   0x178 W/R special-register read selector (5-bit bank address)
+//   0x17c R  {16'h5A5A canary, special_regs.read_data} (synchronous bank read;
+//            retried if a WRSR write suppresses the bank read)
 //
 // 32-bit data, 32-bit addr (low 7 bits = byte offset, ignore [1:0]).
 // Standard 5-channel AXI4-Lite (AW, W, B, AR, R).
@@ -409,7 +414,17 @@ module control_regs #(
     output reg         pmem_we,
     // observability inputs for ISA PMEM
     input  wire [7:0]  fetch_instr,
-    input  wire [6:0]  fetch_pc
+    input  wire [6:0]  fetch_pc,
+
+    // ISA special-register bank debug readback (0x178 selector / 0x17C data).
+    // The bank read port is synchronous, so a 0x17C read is deferred until
+    // the bank reports read_ack; a simultaneous WRSR write suppresses the
+    // bank read (write priority) and this block retries instead of latching
+    // stale read_data.
+    output reg  [4:0]  sr_read_sel,
+    output reg         sr_read_en,
+    input  wire [15:0] sr_read_data,
+    input  wire        sr_read_ack
 );
 
     // ----------------------------------------------------------------
@@ -428,6 +443,14 @@ module control_regs #(
     // araddr at R-handshake time (the old race, see L396 fix below). Driven by
     // exactly one always_ff (the read channel) → single-driver discipline.
     reg ap_done_clr_pulse;
+
+    // 0x17C special-register readback: the bank read is synchronous and a
+    // WRSR write suppresses it (write priority). Wait for read_ack, then
+    // capture the bank's registered data one cycle later.
+    localparam logic [1:0] SR_RD_IDLE = 2'd0;
+    localparam logic [1:0] SR_RD_WAIT = 2'd1;
+    localparam logic [1:0] SR_RD_CAP  = 2'd2;
+    reg [1:0] sr_rd_state;
 
     wire [31:0] ap_ctrl_rdata = {24'b0, ap_auto_restart, 3'b0, ap_ready_reg, ap_idle_reg, ap_done_reg, ap_start_reg};
 
@@ -568,6 +591,9 @@ module control_regs #(
             pmem_write_data <= 32'b0;
             pmem_write_addr <= 8'b0;
             pmem_we         <= 1'b0;
+            sr_read_sel     <= 5'b0;
+            // sr_read_en / sr_rd_state are OWNED by the read-channel
+            // always_ff (including its reset) to keep a single driver.
         end else begin
             // auto-clear ap_start after the kernel picks it up
             if (kernel_busy) ap_start_reg <= 1'b0;
@@ -745,6 +771,9 @@ module control_regs #(
                     9'h168: begin
                         pmem_write_addr <= s_axi_control_wdata[7:0];
                     end
+                    // Special-register AXI read selector (0x178). Selects the
+                    // bank address returned by the 0x17C readback port.
+                    9'h178: sr_read_sel <= s_axi_control_wdata[4:0];
                     default: ;
                 endcase
             end
@@ -788,6 +817,8 @@ module control_regs #(
             s_axi_control_rdata   <= 32'b0;
             probe_data_re         <= 1'b0;   // PROBE-V3 auto-inc pulse
             ap_done_clr_pulse     <= 1'b0;   // DONE-CLEAR-AT-LATCH pulse
+            sr_read_en            <= 1'b0;
+            sr_rd_state           <= SR_RD_IDLE;
         end else begin
             // PROBE-V3: probe_data_re is a 1-cyc pulse, default low. It is the
             // read of 0xB0 that auto-increments the probe read pointer; latched
@@ -801,7 +832,26 @@ module control_regs #(
             // the sticky ap_done is cleared on the SAME read that latched its
             // data (still showing done=1). One driver only (this block).
             ap_done_clr_pulse <= 1'b0;
-            if (s_axi_control_arvalid && !s_axi_control_arready && !s_axi_control_rvalid) begin
+            // 0x17C bank read strobe is a 1-cyc pulse per attempt.
+            sr_read_en <= 1'b0;
+            if (sr_rd_state == SR_RD_WAIT) begin
+                s_axi_control_arready <= 1'b0;
+                if (sr_read_ack) begin
+                    // Read committed; read_data updates on this edge.
+                    // sr_read_en stays at its default low in the capture cycle.
+                    sr_rd_state <= SR_RD_CAP;
+                end else begin
+                    // A WRSR write won this cycle; retry.
+                    sr_read_en <= 1'b1;
+                end
+            end else if (sr_rd_state == SR_RD_CAP) begin
+                // The bank updated read_data on the edge that observed
+                // read_ack, so capture it now (one cycle after the ack).
+                s_axi_control_arready <= 1'b0;
+                s_axi_control_rdata  <= {16'h5A5A, sr_read_data};
+                s_axi_control_rvalid <= 1'b1;
+                sr_rd_state <= SR_RD_IDLE;
+            end else if (s_axi_control_arvalid && !s_axi_control_arready && !s_axi_control_rvalid) begin
                 s_axi_control_arready <= 1'b1;
                 if (s_axi_control_araddr == 8'hb0) probe_data_re <= 1'b1;
                 if (s_axi_control_araddr == 8'he4) dbg_cap_val_re <= 1'b1;
@@ -924,9 +974,20 @@ module control_regs #(
                     // ISA PMEM status / read-back (0x168: write_addr, 0x16C: {canary, PC, fetch_instr})
                     9'h168:  s_axi_control_rdata <= {24'b0, pmem_write_addr};
                     9'h16c:  s_axi_control_rdata <= {16'h504D, 1'b0, fetch_pc, fetch_instr};
+                    9'h178:  s_axi_control_rdata <= {27'b0, sr_read_sel};
+                    9'h17c: begin
+                        // Selector was latched by a previous 0x178 write.
+                        // Issue a synchronous bank read; if a WRSR write wins
+                        // this cycle, read_ack stays low and the WAIT state
+                        // retries instead of latching stale read_data.
+                        sr_read_en  <= 1'b1;
+                        sr_rd_state <= SR_RD_WAIT;
+                    end
                     default: s_axi_control_rdata <= 32'b0;
                 endcase
-                s_axi_control_rvalid <= 1'b1;
+                // 0x17C defers its R response until the bank read commits.
+                if (s_axi_control_araddr != 9'h17c)
+                    s_axi_control_rvalid <= 1'b1;
             end else begin
                 s_axi_control_arready <= 1'b0;
                 if (s_axi_control_rvalid && s_axi_control_rready) s_axi_control_rvalid <= 1'b0;

@@ -300,6 +300,321 @@ module tb_eagle4_drafter #(
         axil_read(ADDR_RES_COUNT, count);
     endtask
 
+    // ================================================================
+    // Isolated ISA WRSR + special-register bank smoke test.
+    // No WEIGHT/SCALE/activation loading: this proves the ISA control path
+    // (PMEM upload -> WRSR -> HALT) and the actual bank's AXI readback.
+    // ================================================================
+    bit sr_test_active = 1'b0;
+    int sr_write_strobes = 0;
+    int sr_read_collisions = 0;
+
+    always @(posedge ap_clk) begin
+        if (ap_rst_n && sr_test_active) begin
+            if (dut.g1_start || dut.g4_start || dut.g5_start || dut.g6_start ||
+                dut.g7g_start || dut.g7u_start || dut.g7p_start ||
+                dut.g9_start || dut.g11_start || dut.glm_start ||
+                dut.g12_start || dut.tree_start || dut.g8_start)
+                $fatal(1, "REGS-only: a stage started");
+            if (out_awvalid || out_wvalid || m_axi_boot_arvalid_u ||
+                m_axi_g8_arvalid_u || m_axi_g8b_arvalid_u ||
+                m_axi_emb_arvalid_u || m_axi_embb_arvalid_u)
+                $fatal(1, "REGS-only: unexpected external-memory transaction");
+            if (dut.u_special_regs.write_en)
+                sr_write_strobes <= sr_write_strobes + 1;
+            // A read request overlapped a WRSR write, so the bank's write
+            // priority suppressed that attempt and control_regs retried.
+            if (dut.u_special_regs.read_en && dut.u_special_regs.write_en)
+                sr_read_collisions <= sr_read_collisions + 1;
+        end
+    end
+
+    task automatic sr_read_reg(input logic [4:0] sel, output logic [31:0] data);
+        axil_write(ADDR_SR_SEL, {27'b0, sel});
+        axil_read(ADDR_SR_DATA, data);
+    endtask
+
+    task automatic wait_pmem_ptr(input int expected, input string tag);
+        logic [31:0] st;
+        int n;
+        st = '0;
+        for (n = 0; n < 20 && st[7:0] != expected[7:0]; n++)
+            axil_read(ADDR_PMEM_ADDR, st);
+        if (st[7:0] !== expected[7:0])
+            $fatal(1, "REGS-only: %s: PMEM pointer %0d, expected %0d",
+                   tag, st[7:0], expected);
+    endtask
+
+    task automatic check_pmem(input int exp_pc, input logic [7:0] exp_instr,
+                              input string tag);
+        logic [31:0] st;
+        axil_read(ADDR_PMEM_DATA, st);
+        if (st[31:16] !== 16'h504D || st[14:8] !== exp_pc[6:0] ||
+            st[7:0] !== exp_instr)
+            $fatal(1, "REGS-only: %s: expected PC=%0d instr=%02x, got %08x",
+                   tag, exp_pc, exp_instr, st);
+    endtask
+
+    task automatic wait_ap_done(input string tag);
+        logic [31:0] st;
+        int n;
+        st = '0;
+        for (n = 0; n < 5000 && !st[1]; n++) axil_read(ADDR_AP_CTRL, st);
+        if (!st[1]) $fatal(1, "REGS-only: %s: timeout waiting for ap_done", tag);
+    endtask
+
+    task automatic pmem_write_at(input int addr, input logic [31:0] data,
+                                 input int next_ptr, input string tag);
+        axil_write(ADDR_PMEM_ADDR, addr);
+        axil_write(ADDR_PMEM_DATA, data);
+        wait_pmem_ptr(next_ptr, tag);
+    endtask
+
+    task automatic run_regs_only();
+        logic [31:0] rd;
+        logic [7:0]  p [0:127];
+        logic [31:0] pw [0:31];
+        logic [15:0] vals [0:10];
+        int nb, nw, n, w, i;
+        int base_writes;
+
+        $display("[%0t] ---- ISA WRSR + special_regs AXI readback test ----", $time);
+
+        // Deterministic nonzero values. r6/r8 set bank-address bit16; r9
+        // packs source=3, destination=9, qzero=1, scale_frac=13.
+        vals[0]  = 16'h0001;
+        vals[1]  = 16'h2345;
+        vals[2]  = 16'h0003;
+        vals[3]  = 16'h0008;
+        vals[4]  = 16'h0008;
+        vals[5]  = 16'h0002;
+        vals[6]  = 16'h0001;
+        vals[7]  = 16'h3456;
+        vals[8]  = 16'h0001;
+        vals[9]  = 16'h1CAD;
+        vals[10] = 16'hBEEF;
+
+        // Reset state: all entries and decoded config outputs are zero, and
+        // an out-of-range selector reads zero with the canary intact.
+        sr_read_reg(5'd0, rd);
+        if (rd !== 32'h5A5A_0000) $fatal(1, "REGS-only: reset r0 %08x", rd);
+        sr_read_reg(5'd15, rd);
+        if (rd !== 32'h5A5A_0000) $fatal(1, "REGS-only: reset reserved %08x", rd);
+        if (dut.u_special_regs.weight_base !== 17'd0 ||
+            dut.u_special_regs.scale_base !== 17'd0 ||
+            dut.u_special_regs.activation_source !== 3'd0)
+            $fatal(1, "REGS-only: config outputs not cleared by reset");
+
+        // Program A: write registers 0..10, then HALT at byte 33. WRSR
+        // instructions start at PCs 0,3,6,...,30, so most immediates cross
+        // a 32-bit PMEM word boundary.
+        nb = 0;
+        for (i = 0; i < 11; i++) begin
+            p[nb]     = 8'h60 | 8'(i);
+            p[nb + 1] = vals[i][7:0];
+            p[nb + 2] = vals[i][15:8];
+            nb = nb + 3;
+        end
+        p[nb] = 8'h40;
+        nb = nb + 1;
+        nw = (nb + 3) / 4;
+        for (i = nb; i < nw * 4; i++) p[i] = 8'h40;
+        for (w = 0; w < nw; w++)
+            pw[w] = {p[4*w + 3], p[4*w + 2], p[4*w + 1], p[4*w]};
+
+        axil_write(ADDR_PMEM_ADDR, 0);
+        for (w = 0; w < nw; w++) axil_write(ADDR_PMEM_DATA, pw[w]);
+        wait_pmem_ptr(nw, "program A");
+        check_pmem(0, 8'h60, "program A pre-run");
+
+        sr_test_active = 1'b1;
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("program A");
+        check_pmem(33, 8'h40, "program A");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 11)
+            $fatal(1, "REGS-only: program A wrote %0d times, expected 11",
+                   sr_write_strobes - base_writes);
+
+        for (i = 0; i < 11; i++) begin
+            sr_read_reg(5'(i), rd);
+            if (rd[31:16] !== 16'h5A5A || rd[15:0] !== vals[i])
+                $fatal(1, "REGS-only: r%0d readback %08x, expected %04x",
+                       i, rd, vals[i]);
+        end
+        for (i = 11; i < 16; i++) begin
+            sr_read_reg(5'(i), rd);
+            if (rd !== 32'h5A5A_0000)
+                $fatal(1, "REGS-only: reserved r%0d readback %08x", i, rd);
+        end
+        sr_read_reg(5'd31, rd);
+        if (rd !== 32'h5A5A_0000)
+            $fatal(1, "REGS-only: reserved r31 readback %08x", rd);
+
+        // Decoded config fields (the next task's engine handoff).
+        if (dut.u_special_regs.activation_base !== 16'h0001 ||
+            dut.u_special_regs.weight_base !== 17'h12345 ||
+            dut.u_special_regs.tile_count !== 16'h0003 ||
+            dut.u_special_regs.chunks_per_tile !== 16'h0008 ||
+            dut.u_special_regs.chunks_per_scale_group !== 16'h0008 ||
+            dut.u_special_regs.output_base !== 16'h0002 ||
+            dut.u_special_regs.scale_base !== 17'h13456 ||
+            dut.u_special_regs.activation_source !== 3'd3 ||
+            dut.u_special_regs.output_destination !== 4'd9 ||
+            dut.u_special_regs.qzero_raw !== 2'd1 ||
+            dut.u_special_regs.scale_frac !== 5'd13 ||
+            dut.u_special_regs.output_conversion !== 16'hBEEF)
+            $fatal(1, "REGS-only: decoded config outputs mismatch");
+
+        // Read-to-clear ap_done followed by idle/ready.
+        repeat (4) @(posedge ap_clk);
+        axil_read(ADDR_AP_CTRL, rd);
+        if (rd[1] || !rd[2] || !rd[3])
+            $fatal(1, "REGS-only: expected idle/ready with ap_done clear, got %08x", rd);
+
+        // Restart: the same program reruns, writing each register once more.
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("program A restart");
+        check_pmem(33, 8'h40, "program A restart");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 11)
+            $fatal(1, "REGS-only: restart wrote %0d times, expected 11",
+                   sr_write_strobes - base_writes);
+        sr_read_reg(5'd10, rd);
+        if (rd !== 32'h5A5A_BEEF) $fatal(1, "REGS-only: r10 after restart %08x", rd);
+
+        // Program B: WRSR at byte 3 (unaligned start) with its two immediate
+        // bytes in word 1, plus a reserved-address write. Word bytes:
+        //   0: 61 AA AA 62 | 4: 55 55 6F AD | 8: DE 40 40 40
+        axil_write(ADDR_PMEM_ADDR, 0);
+        axil_write(ADDR_PMEM_DATA, 32'h62AA_AA61);
+        axil_write(ADDR_PMEM_DATA, 32'hAD6F_5555);
+        axil_write(ADDR_PMEM_DATA, 32'h4040_40DE);
+        wait_pmem_ptr(3, "program B");
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("program B");
+        check_pmem(9, 8'h40, "program B");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 3)
+            $fatal(1, "REGS-only: program B wrote %0d times, expected 3",
+                   sr_write_strobes - base_writes);
+        sr_read_reg(5'd1, rd);
+        if (rd !== 32'h5A5A_AAAA) $fatal(1, "REGS-only: crossing r1 %08x", rd);
+        sr_read_reg(5'd2, rd);
+        if (rd !== 32'h5A5A_5555) $fatal(1, "REGS-only: crossing r2 %08x", rd);
+        sr_read_reg(5'd15, rd);
+        if (rd !== 32'h5A5A_0000) $fatal(1, "REGS-only: reserved write took %08x", rd);
+        sr_read_reg(5'd0, rd);
+        if (rd !== 32'h5A5A_0001) $fatal(1, "REGS-only: r0 disturbed %08x", rd);
+        sr_read_reg(5'd3, rd);
+        if (rd !== 32'h5A5A_0008) $fatal(1, "REGS-only: r3 disturbed %08x", rd);
+
+        // Program C: end-of-PMEM WRSR. JMP at byte 0 targets word 31; two
+        // WRSRs at bytes 124 and 127. The byte-127 instruction's immediates
+        // are bytes 127 (low) and the wrapped byte 0 (high); PC then wraps
+        // to byte 2, where HALT sits.
+        pmem_write_at(0,  32'h4040_5A3F, 1, "program C word0");
+        pmem_write_at(31, 32'h6512_3464, 0, "program C word31");
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("program C");
+        check_pmem(2, 8'h40, "program C");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 2)
+            $fatal(1, "REGS-only: program C wrote %0d times, expected 2",
+                   sr_write_strobes - base_writes);
+        sr_read_reg(5'd4, rd);
+        if (rd !== 32'h5A5A_1234) $fatal(1, "REGS-only: end-wrap r4 %08x", rd);
+        sr_read_reg(5'd5, rd);
+        if (rd !== 32'h5A5A_5A3F) $fatal(1, "REGS-only: end-wrap r5 %08x", rd);
+        sr_read_reg(5'd1, rd);
+        if (rd !== 32'h5A5A_AAAA) $fatal(1, "REGS-only: r1 lost %08x", rd);
+        sr_read_reg(5'd2, rd);
+        if (rd !== 32'h5A5A_5555) $fatal(1, "REGS-only: r2 lost %08x", rd);
+        sr_read_reg(5'd7, rd);
+        if (rd !== 32'h5A5A_3456) $fatal(1, "REGS-only: r7 lost %08x", rd);
+
+        // Reserved opcode (0xE0): fail-safe HALT, no bank write, no stage.
+        pmem_write_at(0, 32'h4040_40E0, 1, "reserved opcode");
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("reserved opcode");
+        check_pmem(0, 8'hE0, "reserved opcode");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 0)
+            $fatal(1, "REGS-only: reserved opcode wrote the bank");
+
+        // JMP semantics preserved: JMP word 0 -> word 1; HALT at byte 4.
+        axil_write(ADDR_PMEM_ADDR, 0);
+        axil_write(ADDR_PMEM_DATA, 32'h0000_0021);
+        axil_write(ADDR_PMEM_DATA, 32'h0000_0040);
+        wait_pmem_ptr(2, "JMP program");
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        wait_ap_done("JMP program");
+        check_pmem(4, 8'h40, "JMP program");
+        @(negedge ap_clk);
+        if (sr_write_strobes - base_writes != 0)
+            $fatal(1, "REGS-only: JMP wrote the bank");
+
+        // Arbitration: a 22-WRSR + JMP loop writes the bank on 22 of every
+        // 23 cycles. AXI 0x17C reads issued while it runs must retry through
+        // write-suppressed bank reads and return the live value, not stale
+        // pre-loop data. r0 changes from 0x0001 to 0x1234 on the first
+        // iteration; r1 becomes 0x5678.
+        nb = 0;
+        for (i = 0; i < 21; i++) begin
+            p[nb]     = 8'h60;
+            p[nb + 1] = 8'h34;
+            p[nb + 2] = 8'h12;
+            nb = nb + 3;
+        end
+        p[nb]     = 8'h61;   // byte 63: WRSR r1 (immediates at 64/65)
+        p[nb + 1] = 8'h78;
+        p[nb + 2] = 8'h56;
+        nb = nb + 3;
+        p[nb] = 8'h20;       // byte 66: JMP word 0
+        nb = nb + 1;
+        p[nb] = 8'h40;       // pad
+        nb = nb + 1;
+        nw = (nb + 3) / 4;
+        for (i = nb; i < nw * 4; i++) p[i] = 8'h40;
+        for (w = 0; w < nw; w++)
+            pw[w] = {p[4*w + 3], p[4*w + 2], p[4*w + 1], p[4*w]};
+
+        axil_write(ADDR_PMEM_ADDR, 0);
+        for (w = 0; w < nw; w++) axil_write(ADDR_PMEM_DATA, pw[w]);
+        wait_pmem_ptr(nw, "program D");
+        sr_read_reg(5'd0, rd);
+        if (rd !== 32'h5A5A_0001) $fatal(1, "REGS-only: r0 pre-loop %08x", rd);
+
+        base_writes = sr_write_strobes;
+        axil_write(ADDR_AP_CTRL, 1);
+        for (n = 0; n < 40 && (sr_write_strobes - base_writes) < 4; n++)
+            @(posedge ap_clk);
+        if (sr_write_strobes - base_writes < 4)
+            $fatal(1, "REGS-only: arbitration loop did not start");
+        axil_read(ADDR_AP_CTRL, rd);
+        if (rd[1] || rd[2])
+            $fatal(1, "REGS-only: expected busy kernel during arbitration, got %08x", rd);
+
+        for (i = 0; i < 8; i++) begin
+            sr_read_reg(5'd0, rd);
+            if (rd !== 32'h5A5A_1234)
+                $fatal(1, "REGS-only: arbitration r0 read %08x (stale?)", rd);
+        end
+        sr_read_reg(5'd1, rd);
+        if (rd !== 32'h5A5A_5678)
+            $fatal(1, "REGS-only: arbitration r1 read %08x", rd);
+        if (sr_read_collisions == 0)
+            $fatal(1, "REGS-only: no bank read/WRSR collision was exercised");
+        $display("PASS: WRSR readback, crossings, reserved, restart, JMP/HALT, wrap, arbitration (collisions=%0d).",
+                 sr_read_collisions);
+    endtask
+
     // Isolated ISA contract: STATE G1 must finish both full-width norms,
     // then HALT without launching a downstream stage or external DMA.
     // Use the clean output strobes, not rmsnorm_apply's delayed out_valid.
@@ -348,6 +663,10 @@ module tb_eagle4_drafter #(
         if ($test$plusargs("G1_ONLY")) begin
             repeat (200_000) @(posedge ap_clk);
             $fatal(1, "G1-only: global watchdog expired");
+        end
+        if ($test$plusargs("REGS_ONLY")) begin
+            repeat (200_000) @(posedge ap_clk);
+            $fatal(1, "REGS-only: global watchdog expired");
         end
     end
 
@@ -442,6 +761,12 @@ module tb_eagle4_drafter #(
 
         if ($test$plusargs("G1_ONLY")) begin
             run_g1_only();
+            $finish;
+            disable main_sequence;
+        end
+
+        if ($test$plusargs("REGS_ONLY")) begin
+            run_regs_only();
             $finish;
             disable main_sequence;
         end

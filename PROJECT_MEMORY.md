@@ -47,3 +47,27 @@
     - In `eagle4_drafter.sv`: Instantiated `instruction_fetcher u_fetcher`, wired `pmem_write_data_w`, `pmem_write_addr_w`, `pmem_we_w` from `control_regs`, wired `adv_en` to `start_pulse`, and connected `fetch_instr` / `fetch_pc` back to `control_regs` for live status readback.
     - In `sim_local/tb/tb_eagle4_drafter.sv` & `eagle4_regmap_pkg.sv`: Added automated self-check testing PMEM write-pointer reset via `0x168`, auto-incrementing word loading via `0x16C`, 0-cycle combinational instruction fetch at PC=0, and PC advancement + next instruction fetch upon kernel launch (`ap_start`).
     - Verified: `make lint` passes cleanly; `make sim MODE=fast` passes end-to-end with 0 errors.
+- **2026-10-24: WRSR + 11-entry `special_regs` bank integrated.**
+  - `instruction_fetcher.sv`: opcode `011` (WRSR) is a three-byte instruction
+    (`0x60|reg`, imm low, imm high). Executes in one cycle, produces exactly
+    one bank write strobe, advances PC by 3. Immediates are fetched
+    combinationally and may cross PMEM word boundaries; byte addressing
+    wraps modulo 128 (PC 126/127 read wrapped bytes). Reserved opcodes
+    `100..111` remain HALT; JMP/STATE/HALT semantics unchanged.
+  - `special_regs.sv`: expanded to 11 x 16-bit entries (0..10) while
+    preserving reset > write > read precedence, reserved-write ignore /
+    reserved-read zero, and read hold. Added a separate AXI read selector,
+    `read_ack`, and decoded configuration outputs for the GEMV controller.
+    Addresses: activation_base, weight_base low/high, tile_count,
+    chunks_per_tile, chunks_per_scale_group, output_base, scale_base
+    low/high, packed routing/numeric word, output_conversion.
+  - `control_regs.sv`: `0x178` write/read selector, `0x17C` read
+    `{16'h5A5A, read_data}` with a WAIT/CAPTURE state machine. A WRSR write
+    suppresses the bank read; the AXI read retries on `read_ack` instead of
+    returning stale data.
+  - Verification: standalone `special_regs` and `instruction_fetcher`
+    directed simulations; new full-top `+REGS_ONLY` mode
+    (`make sim MODE=regs`) covering all 11 registers, crossings, unaligned
+    WRSR, reserved addresses, restart, JMP/HALT, reserved opcode, end-of-PMEM
+    wrap, and a 22-write/23-cycle arbitration loop; existing `+G1_ONLY`
+    re-passed to preserve STATE semantics.

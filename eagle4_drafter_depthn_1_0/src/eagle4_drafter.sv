@@ -1796,6 +1796,31 @@ module eagle4_drafter #(
     wire        isa_is_state_w;
     wire        isa_running_w;
     wire        isa_halted_w;
+    wire        isa_sr_write_en_w;
+    wire [4:0]  isa_sr_write_sel_w;
+    wire [15:0] isa_sr_write_data_w;
+    wire        sr_read_en_w;
+    wire [4:0]  sr_read_sel_w;
+    wire [15:0] sr_read_data_w;
+    wire        sr_read_ack_w;
+
+    // Execution-config fields decoded by the special-register bank. These
+    // hand off to the GEMV operation controller in the next integration
+    // stage (it latches them at START); this stage only stores/readbacks.
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [15:0] sr_activation_base_w;
+    wire [16:0] sr_weight_base_w;
+    wire [15:0] sr_tile_count_w;
+    wire [15:0] sr_chunks_per_tile_w;
+    wire [15:0] sr_chunks_per_scale_group_w;
+    wire [15:0] sr_output_base_w;
+    wire [16:0] sr_scale_base_w;
+    wire [2:0]  sr_activation_source_w;
+    wire [3:0]  sr_output_destination_w;
+    wire [1:0]  sr_qzero_raw_w;
+    wire [4:0]  sr_scale_frac_w;
+    wire [15:0] sr_output_conversion_w;
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // AXI4-Lite register file.
     control_regs #(.COL_W(20)) u_ctrl (
@@ -1908,7 +1933,11 @@ module eagle4_drafter #(
         .pmem_write_addr(pmem_write_addr_w),
         .pmem_we(pmem_we_w),
         .fetch_instr(fetch_instr_w),
-        .fetch_pc(fetch_pc_w)
+        .fetch_pc(fetch_pc_w),
+        .sr_read_sel(sr_read_sel_w),
+        .sr_read_en(sr_read_en_w),
+        .sr_read_data(sr_read_data_w),
+        .sr_read_ack(sr_read_ack_w)
     );
 
     instruction_fetcher u_fetcher (
@@ -1925,7 +1954,34 @@ module eagle4_drafter #(
         .state_id   (isa_state_id_w),
         .is_state   (isa_is_state_w),
         .running    (isa_running_w),
-        .halted     (isa_halted_w)
+        .halted     (isa_halted_w),
+        .sr_write_en  (isa_sr_write_en_w),
+        .sr_write_sel (isa_sr_write_sel_w),
+        .sr_write_data(isa_sr_write_data_w)
+    );
+
+    special_regs u_special_regs (
+        .clk        (ap_clk),
+        .rst_en     (ap_rst_n),
+        .write_en   (isa_sr_write_en_w),
+        .write_select(isa_sr_write_sel_w),
+        .write_data (isa_sr_write_data_w),
+        .read_en    (sr_read_en_w),
+        .read_select(sr_read_sel_w),
+        .read_data  (sr_read_data_w),
+        .read_ack   (sr_read_ack_w),
+        .activation_base       (sr_activation_base_w),
+        .weight_base           (sr_weight_base_w),
+        .tile_count            (sr_tile_count_w),
+        .chunks_per_tile       (sr_chunks_per_tile_w),
+        .chunks_per_scale_group(sr_chunks_per_scale_group_w),
+        .output_base           (sr_output_base_w),
+        .scale_base            (sr_scale_base_w),
+        .activation_source     (sr_activation_source_w),
+        .output_destination    (sr_output_destination_w),
+        .qzero_raw             (sr_qzero_raw_w),
+        .scale_frac            (sr_scale_frac_w),
+        .output_conversion     (sr_output_conversion_w)
     );
 
     generate

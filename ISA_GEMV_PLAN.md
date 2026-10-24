@@ -1,5 +1,19 @@
 # ISA-Controlled GEMV Plan
 
+## Current implementation status (2026-10)
+
+Stage 1 is implemented and committed: WRSR (opcode `011`, three-byte
+little-endian immediate) writes the 11-entry ISA special-register bank, the
+fetcher advances `PC += 3`, and the actual bank is readable over AXI
+(`0x178` selector, `0x17C` `{16'h5A5A, read_data}` with synchronous-read
+retry under WRSR arbitration). The bank exposes decoded configuration
+outputs for the future operation controller. The shared GEMV datapath,
+operation START/BUSY/DONE status, tile controller, input/output routing,
+and GEMV opcode are **not yet implemented**; the next stage integrates the
+real engine and latches these fields at START. Numeric-field validation
+(e.g. supported `scale_frac`, `qzero_raw`, group size) also belongs to that
+engine stage, not to the register bank.
+
 ## Scope
 
 Replace `stage_sel`-derived GEMV configuration with ISA-programmable operation registers, while retaining the physical **128 lanes × 16 input elements per chunk**.

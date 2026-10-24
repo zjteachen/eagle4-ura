@@ -8,8 +8,12 @@ Current status (ISA v1, 2026-09):
 
 - `instruction_fetcher.sv` executes byte instructions out of the 32-word
   PMEM: STATE (5-bit sequencer state ID), JMP (word-aligned PMEM target),
-  HALT, reserved-as-HALT. Encoding and state IDs: see the
-  *ISA State Encodings & Instruction Set* section in `COMPONENTS.md`.
+  HALT, WRSR (three-byte special-register write), reserved-as-HALT.
+  Encoding and state IDs: see the *ISA State Encodings & Instruction Set*
+  section in `COMPONENTS.md`.
+- `special_regs.sv` is the actual 11-entry ISA configuration bank, written
+  by WRSR and readable over AXI (`0x178`/`0x17C`). WRSR immediates may cross
+  PMEM word boundaries; sequential byte addressing wraps modulo 128.
 - `eagle4_drafter.sv` decodes the fetcher's state ID into the same
   stage-start pulses, `stage_sel`, and busy/done handshake the FSM used to
   drive, so every existing stage sees identical control timing.
@@ -72,6 +76,24 @@ alone, while the scale engine can skip division on its saturation path.
 ## Phase 2 — Microprogram instruction testing
 
 Goal: exercise the ISA machinery itself.
+
+### Implemented: bounded WRSR/register test
+
+Run `make sim MODE=regs` (or `sim_local/run_sim.sh regs`). The test skips all
+WEIGHT/SCALE/activation loading and uses only the real top with AXI PMEM
+upload:
+
+- Writes all 11 bank registers, then HALT; reads each back through the
+  actual bank (`0x178` selector, `0x17C` data) and checks decoded config
+  outputs at the top.
+- Covers WRSR word crossing, unaligned WRSR starts, reserved-address writes
+  (ignored) and reads (zero), restart after HALT, and read-to-clear status.
+- Runs WRSR at the end of PMEM (byte 127) and at byte 126 to prove the
+  modulo-128 byte wrap and 3-byte PC advance.
+- Checks reserved opcodes still HALT and JMP remains word-aligned.
+- Runs a 22-WRSR-per-23-cycle loop and issues repeated AXI bank reads while
+  it runs, requiring at least one write-suppressed bank-read collision and
+  live data (no stale read).
 
 - JMP: programs that jump over dummy bytes; assert `pc_out` (readable via
   the 0x16C status word) lands on the word-aligned target, and that

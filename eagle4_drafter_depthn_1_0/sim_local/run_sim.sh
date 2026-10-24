@@ -6,6 +6,8 @@
 # Usage:
 #   ./run_sim.sh g1           # upload STATE G1; HALT over AXI-Lite; check
 #                              #   isolated RMSNorm execution (no weights)
+#   ./run_sim.sh regs         # ISA WRSR -> special_regs bank / AXI readback
+#                              #   test (no weight/activation loads)
 #   ./run_sim.sh              # full depth: real WEIGHT/SCALE bank sizes
 #                              #   (~14.7M direct-drive pokes -- slow, but
 #                              #   the true load, matching real hardware)
@@ -28,6 +30,8 @@ if [[ "${1:-}" == "fast" ]]; then
     DEPTH_ARGS=(-GTEST_WEIGHT_DEPTH=8 -GTEST_SCALE_DEPTH=8)
 elif [[ "${1:-}" == "g1" ]]; then
     SIM_ARGS=(+G1_ONLY)
+elif [[ "${1:-}" == "regs" ]]; then
+    SIM_ARGS=(+REGS_ONLY)
 fi
 
 verilator --binary --timing -Wno-fatal \

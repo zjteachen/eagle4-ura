@@ -41,6 +41,8 @@ package eagle4_regmap_pkg;
     // ---- ISA PMEM mailbox & status ----
     localparam int ADDR_PMEM_ADDR      = 'h168; // W write_addr pointer | R {24'b0, write_addr}
     localparam int ADDR_PMEM_DATA      = 'h16c; // W write_data (autoincs write_addr) | R {16'h504D, 1'b0, PC, instr}
+    localparam int ADDR_SR_SEL         = 'h178; // W/R special-reg read selector (5-bit)
+    localparam int ADDR_SR_DATA        = 'h17c; // R {16'h5A5A, special_regs.read_data}
 
     // ---- dbg_residency.sv self-check: "did my load actually land" ----
     localparam int ADDR_RES_SEL   = 'hec; // W [2:0] buffer select (0=EMB,1=HFC,2=GAMMA,3=WEIGHT,4=SCALE), bit3=clear pulse

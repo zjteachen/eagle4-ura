@@ -21,6 +21,31 @@ Task tracker for EAGLE-3 draft-head FPGA offload (`eagle4_drafter_depthn_1_0/`, 
 - [ ] Exploit sequencing flexibility for datapath optimizations (stage reordering, inter-stage pipelining).
 - [ ] Determine predicate policy: host-programmable registers vs static config straps (`eagle4_config.svh`).
 
+## Completed ISA
+
+- [x] Instruction fetcher byte-granular ISA: STATE/JMP/HALT plus WRSR
+      (three-byte, `0x60|reg`, little-endian imm16, one bank write, `PC += 3`).
+      WRSR immediates may cross PMEM word boundaries; byte addressing wraps
+      modulo 128. Reserved opcodes remain fail-safe HALT; JMP stays
+      word-aligned; `make sim MODE=g1` still passes.
+- [x] `special_regs.sv` expanded from the six-entry exercise bank to the
+      actual 11-entry ISA execution-configuration bank (addresses 0..10;
+      reserved 11..31 ignore writes / read zero), preserving reset > write >
+      read precedence, with decoded config outputs for the GEMV controller.
+- [x] AXI bank readback: `0x178` selector, `0x17C`
+      `{16'h5A5A, read_data}`. Synchronous bank-read latency and WRSR write
+      priority are handled by wait/retry on `read_ack` (no silent stale reads).
+- [x] Full-top `+REGS_ONLY` smoke (`make sim MODE=regs`): PMEM upload ->
+      WRSR -> HALT -> AXI readback, all 11 registers, unaligned/crossing
+      immediates, reserved addresses, restart, end-of-PMEM wrap, JMP/HALT,
+      reserved opcode, and a dense WRSR/read arbitration loop.
+
+### Next ISA stage (not implemented)
+
+- [ ] GEMV opcode + real shared-engine START/wait, status, tile controller,
+      activation/output routing, and configuration latch/validation. No
+      descriptor bypass or mocked/no-op GEMV path.
+
 ## Completed Tooling
 
 - [x] Verilator 5.046 setup for local linting and elaboration.
