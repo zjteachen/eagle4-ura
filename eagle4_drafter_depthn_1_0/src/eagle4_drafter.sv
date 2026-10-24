@@ -924,6 +924,8 @@ module eagle4_drafter #(
         `BUFSPLIT_WR(h_fc_buf, hfc_we, hfc_wr_chunk, hfc_wr_word, hfc_wr_data32)
     end
 
+    // G1 hidden RMSNorm input. Full-width requests use slots 1..192 for
+    // logical chunks 0..191. Keep the final read live through phase drain.
     wire [EMB_CW-1:0] g1_req_chunk;
     wire              g1_req_valid;
 
@@ -948,6 +950,8 @@ module eagle4_drafter #(
     wire signed [EMB_K_PAR*EMB_AW-1:0] f2_fr_rd_data_w;
     wire                               f2_lvl_ge1_w;
 
+    // Optional address register plus the data register below: match the
+    // RMSNorm engine's RDATA_LAT to this path (2 with BUFRDREG, otherwise 1).
     (* keep = "true", max_fanout = 8 *) reg [EMB_CW-1:0] g1_rd_chunk_q;
     reg                                                  g1_rd_inrange_q;
     always_ff @(posedge ap_clk) begin
@@ -998,6 +1002,9 @@ module eagle4_drafter #(
     wire                    rms_g1_out_valid;
     wire                    g1_done;
 
+    // S = sum(x*x); engine input = (S*43691)>>31. The apply path shifts
+    // x*scale by 10 into an 18-bit intermediate, then multiplies gamma (>>12).
+    // SUMSQ_RSHIFT is unused when SUMSQ_MULT is nonzero.
     rmsnorm_block #(.H(3072), .K_PAR(16), .A_WIDTH(16),
                     .SUMSQ_RSHIFT(12),
                     .SUMSQ_MULT(43691), .SUMSQ_SHR(31), .SCALE_SHR(10),
@@ -1332,6 +1339,8 @@ module eagle4_drafter #(
     wire       g5_attn_done;
     reg        g5_done_r;
 
+    // G4 captures Q, then K, then V: each projection has 3072 outputs.
+    // At LANES=128 this is 24 tiles per projection, 72 array launches total.
     localparam int G4_STAGE_SEL = 4'd0;
     localparam int G4_OUT       = 3072;
     localparam int G4_NTILES    = (G4_OUT + LANES - 1) / LANES;
@@ -1594,6 +1603,8 @@ module eagle4_drafter #(
 
     wire signed [S7A_OUT_W-1:0] s7a_q_in, s7a_k_in, s7a_v_in;
 
+    // Either requantize the complete Q/K/V vectors here, or pass the raw
+    // INT32 buffers to attention_full_mha_sbuf for selected-head requantization.
     generate if (!REQUANT_HEADMUX) begin : g_seam_requant
 
         g4_qkv_seam #(
@@ -2109,6 +2120,9 @@ module eagle4_drafter #(
         end
     end
 
+    // G1 advances on the hidden norm's done, not a join of both norms.
+    // Their scale engines can have different latencies; G4 separately waits
+    // for both full-width R1 buffers before issuing its first tile.
     wire isa_done =
           (isa_wait_id == ISA_S_G1)      ? g1_done        :
           (isa_wait_id == ISA_S_G4)      ? g4_done        :
@@ -2531,6 +2545,8 @@ module eagle4_drafter #(
 
     wire [PREMLP_CW-1:0] premlp_rd_idx_b = array_chunk_idx_b_out[PREMLP_CW-1:0];
 
+    // Connected G4 input is R1 = [embedding_norm, hidden_norm].
+    // With CONNECT_SEAMS=0, G4 instead consumes the external a_chunk port.
     wire [3:0] act_stage_sel = tt_stage_g12 ? 4'd5 : stage_sel;
     wire signed [K_PAR*A_WIDTH-1:0] a_chunk_connected =
           (act_stage_sel == 4'd0) ? seam_r1_rd
@@ -2732,6 +2748,9 @@ module eagle4_drafter #(
 
     wire seam_r1_full;
 
+    // G4 tile scheduler: wait for both R1 halves, settle the bank column
+    // address, issue one array launch, then wait for completion. Advance
+    // through all Q/K/V tiles before reporting g4_done.
     localparam int G4_SEQ_TW = $clog2(G4_TOT_TILES);
     typedef enum logic [1:0] {
         G4SQ_IDLE   = 2'd0,
@@ -2915,6 +2934,9 @@ module eagle4_drafter #(
         assign batch_sib_lo_w = bt_sib_cap[31:0];
         assign batch_sib_hi_w = {16'hB500, bt_sib_cap[47:32]};
 
+        // Remove the scale's fractional bits from the 48-bit group-summed
+        // result: add half, arithmetic-shift, then saturate to signed INT32.
+        // The result retains the activation's fractional-bit convention.
         genvar sl;
         for (sl = 0; sl < LANES; sl = sl + 1) begin : g_scaled_requant
             wire signed [RES_W-1:0] rq = result_q_per_lane[sl*RES_W +: RES_W];
@@ -3059,6 +3081,9 @@ module eagle4_drafter #(
         end
     endfunction
 
+    // R1 stores both complete G1 outputs. The array reads embedding chunks
+    // first, then hidden chunks. Delay each apply enable by two cycles to
+    // align writes with data; raw RMSNorm out_valid is one cycle later.
     generate
     if (SEAM_R1_FULLW) begin : g_seam_r1_fullw
 

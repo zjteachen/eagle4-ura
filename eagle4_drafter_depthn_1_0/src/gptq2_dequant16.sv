@@ -1,29 +1,8 @@
-// =====================================================================
-// gptq2_dequant16.sv
-// One-cycle (combinational) GPTQ-2bit dequant block — 16 lanes wide.
-// =====================================================================
-//
-// Takes:
-//   qw_word  — one int32 of qweight  [K/16, N] holding 16 raw 2-bit weights
-//              for ONE output column n, 16 consecutive input rows k.
-//              lane i corresponds to k = k_chunk*16 + i.
-//   qz_word  — one int32 of qzeros   [K/128, N/16] holding 16 raw 2-bit zeros
-//              for ONE group g, 16 consecutive output columns n.
-//              The zero for THIS output column is at index n_idx = n % 16.
-//   n_idx    — 4-bit selector into qz_word (which of the 16 zeros to use).
-//
-// Produces:
-//   w_s_packed — 16 × 3-bit signed dequantized weights, packed.
-//                Lane i = w_s_packed[i*3 +: 3]  ∈ [-4..+2] (3-bit two's-comp).
-//                w_signed[i] = w_raw[i] - (z_raw + 1).
-//
-// Numerical contract: matches reference/src/gptq.cpp gptq2_gemv unpack stage
-// (sym=True, group_size=128, pack=16, packed-along-input qweight, packed-along
-//  -output qzeros).
-//
-// This is a pure-combinational lookup + subtract — no clock, no register.
-// Wraps into the lane MAC chain just before mac_2bit_* via w_raw + z_raw.
-// =====================================================================
+// Combinational decoding of 16 packed two-bit weights.
+// qw_word[2*i +: 2] holds input element i for one output column.
+// qz_word holds 16 two-bit zero codes; n_idx selects this column's code.
+// Each signed three-bit output is raw_weight - (raw_zero + 1), in [-4, 2].
+// There is no scale multiplication or pipeline register in this module.
 
 `timescale 1ns/1ps
 `default_nettype none

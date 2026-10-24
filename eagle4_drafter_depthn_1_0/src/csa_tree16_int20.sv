@@ -1,32 +1,7 @@
-// =====================================================================
-// csa_tree16_int20.sv
-// State-of-the-art Wallace 3:2 carry-save adder tree.
-// Reduces 16 × signed INT20 products into 1 × signed INT26 sum.
-// =====================================================================
-//
-// Why this exists:
-//   The naive CPA (carry-propagate-add) tree has carry chains AT EVERY
-//   LEVEL.  For our 16-wide INT20→INT26 reduction that's 4 × ~13 levels
-//   of LUTCY = ~54 logic levels combinational = 10.21 ns on V80 (see
-//   gemv_lane_int_pilot V5a ooc-synth).  That hard-fails 300 MHz timing.
-//
-//   This module replaces the CPA tree with a **Wallace 3:2 CSA** tree.
-//   Each CSA stage costs 1 LUT delay (pure XOR + majority) — NO carry
-//   propagation between bit positions.  Carries are only resolved at the
-//   very end by ONE CPA, mapped to a DSP58's dedicated 48-bit adder.
-//
-// Reduction schedule:
-//   Stage A (combinational, registered at end):
-//      16 → 11 → 8 → 6      (3 layers of 3:2 CSA)
-//   Stage B (combinational, registered at end):
-//       6 →  4 → 3 → 2      (3 layers of 3:2 CSA)
-//   Stage C (DSP58 add, registered output):
-//       2 → 1                (final CPA on DSP)
-//
-// Latency:    3 cycles      (1 per pipeline stage)
-// Throughput: II=1
-// Bit-exact: same integer sum as a naive 16-input add (no approximation)
-// =====================================================================
+// Three-stage Wallace carry-save reduction: 16 signed INT20 inputs to
+// one signed INT26 sum, with one input vector accepted per clock.
+// Stage A reduces 16->11->8->6 partials; B reduces 6->4->3->2;
+// C resolves the final carry-propagate add. Valid follows the same pipeline.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -149,9 +124,7 @@ module csa_tree16_int20 (
     // ================================================================
     // STAGE C — final CPA  (one signed 26-bit add)
     // ================================================================
-    // We map this to a DSP58 by giving Vivado a hint via USE_DSP.  At
-    // 26-bit width DSP58 isn't strictly required, but for the full
-    // production K_PAR=64 tree (~28-bit) the DSP is worth it.
+    // Request DSP implementation of the final carry-propagate add.
     (* USE_DSP = "yes" *) logic signed [25:0] sum_cpa;
     assign sum_cpa = $signed(sB[0]) + $signed(sB[1]);
 

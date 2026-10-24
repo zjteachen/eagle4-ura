@@ -10,9 +10,10 @@ The EAGLE-4 Drafter is a dedicated hardware accelerator for the EAGLE-3 speculat
 
 | Stage | Identification | Operation | Dimension / Datapath | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **G1** | Input RMSNorm & Projection | $x_{norm} = \text{RMSNorm}(x)$, $QKV = W_{qkv} \cdot x_{norm}$ | $1536 \rightarrow 4608$ (Q: 1536, K: 1536, V: 1536) | Shared GEMV Array |
-| **G4/G5** | Rotary Embedding & KV Append | $Q_{rope} = \text{RoPE}(Q)$, $K_{rope} = \text{RoPE}(K)$, append $(K_{rope}, V)$ | 16 heads $\times$ 64 dim (or 128 dim) | Windowed KV Cache |
-| **G6** | Multi-Head Attention (MHA) | $S = Q \cdot K^T / \sqrt{d}$, $P = \text{Softmax}(S)$, $O = P \cdot V$ | Context window $\le$ 8192 | Static buffer MHA |
+| **G1** | Hidden and embedding RMSNorm | Normalize the two vectors independently, then expose `[embedding_norm, hidden_norm]` through R1 | Two 3072-element INT16 vectors; 16 elements per chunk | Two `rmsnorm_block` instances with DEPTH_N=0; no GEMV |
+| **G4** | QKV projection | Three projections of the same 6144-element input | $6144 \rightarrow 9216$ (Q, K, V: 3072 each) | Shared scaled integer GEMV array; 72 tiles at LANES=128 |
+| **G5** | Rotary embedding, KV append and attention | Rotate Q/K, append K/V and compute attention | 24 heads × 128 dimensions | `attention_full_mha_sbuf` |
+| **G6** | Attention output projection | $O = W_o \cdot \text{attention}$ | $3072 \rightarrow 3072$ | Shared GEMV array, stage_sel=1 |
 | **G7G/U**| MLP Gate & Up Projections | $G = W_{gate} \cdot x$, $U = W_{up} \cdot x$ | $1536 \rightarrow 4096$ each | Shared GEMV Array |
 | **G7_SILU**| SwiGLU Activation | $A = \text{SiLU}(G) \odot U$ | 4096-dim vector | Pipelined DSP mul |
 | **G9** | MLP Down Projection | $Y = W_{down} \cdot A + x_{residual}$ | $4096 \rightarrow 1536$ | Shared GEMV Array |
@@ -22,6 +23,49 @@ The EAGLE-4 Drafter is a dedicated hardware accelerator for the EAGLE-3 speculat
 | **TREE** | Speculative Draft Tree Engine | Tile streaming, logit scaling, top-K selection, branch expansion | Multi-level depth loop ($D \le \text{max\_depth}$) | Tree level FSM |
 | **G8** | Vocabulary Rescore (G8_SPLICE)| Fused gather-dot exact logit validation | P-parallel FP16 inner products | External HBM embeddings |
 | **OUT** | Output Formatting | Format frontier graph into `OUT_ABI_V24` | Token IDs, scores, parent indices | AXI4 Master Write-DMA |
+
+### G1 and G4 RTL review map
+
+Paths below are relative to `eagle4_drafter_depthn_1_0/src/`.
+Start with the top-level integration, then follow the arithmetic primitives:
+
+| Area | RTL file / symbol | Responsibility |
+| :--- | :--- | :--- |
+| G1 input/control | `eagle4_drafter.sv`: `u_rmsnorm_g1`, `u_rmsnorm_g1_e` | Hidden/embedding/gamma reads and concurrent starts |
+| G1 sequencing | `rmsnorm_block.sv` | Sum pass, scale computation, apply pass and pipeline drain |
+| G1 reduction | `rmsnorm_sumsq.sv` | Signed squares, chunk reduction, 64-bit accumulation |
+| G1 scale | `rmsnorm_scale_int.sv` | Integer square root and reciprocal division, with early saturation |
+| G1 apply | `rmsnorm_apply.sv` | Two shifted multiplies, intermediate-width handling and output saturation |
+| G1→G4 storage | `eagle4_drafter.sv`: `g_seam_r1_fullw`; `stage_io_buffer_sel.sv`, `stage_io_buffer_ff.sv` | Two complete vectors; embedding half precedes hidden half |
+| G4 control/capture | `eagle4_drafter.sv`: `g4seq_state`, `q_full_buf`, `k_full_buf`, `v_full_buf` | Wait for R1, issue all tiles, capture each result and signal completion |
+| G4 array | `gemv_stage_array_scaled_slr.sv` | Per-group broadcast registers, per-lane memories, lane instances and result registers |
+| G4 arithmetic | `gemv_lane_scaled_stream.sv`; optional `gemv_lane_scaled_stream_dual.sv` | Integer dot products, 128-element group sums and fixed-point scale multiplication |
+| Weight decoding/reduction | `gptq2_dequant16.sv`, `csa_tree16_int20.sv` | Two-bit code minus zero-point; three-stage carry-save reduction |
+| Weight/scale storage | `stage_geometry.svh`, `weight_bank_multistage.sv`, `weight_bank_uram.sv`, `scale_bram.sv` | Shared stage dimensions, flat per-lane addressing and synchronous reads |
+| G4 output conversion | `eagle4_drafter.sv`: `g_scaled_requant`; `attention_full_mha_sbuf.sv`: `g_head_raw` | Remove scale fractional bits into INT32, then convert the selected head to INT16 |
+| Optional full-vector conversion | `g4_qkv_seam.sv` | Used instead of selected-head conversion when `REQUANT_HEADMUX=0` |
+
+Current source defaults select the scaled, single-port, 128-lane array with
+16 activation elements per chunk, 128-element scale groups and 13 fractional
+scale bits. The lane accumulates signed integer group sums times signed scales
+into 48 bits; it does not perform FP16 arithmetic.
+
+**Configuration matters:** `eagle4_config.svh` currently sets `CONNECT_SEAMS=0`.
+G4 therefore selects external `a_chunk`, not R1 data, unless a build overrides
+that parameter or stage injection selects another source. The local smoke
+test ties the external input to zero. The G4 scheduler still waits for R1 full.
+`REQUANT_HEADMUX=1` selects conversion inside the attention module rather than
+instantiating `g4_qkv_seam`. Packaged intent files may describe different values.
+
+**Arithmetic/control caveats retained by the comment-only cleanup:**
+- G1's `sat_scale` overflow check omits the retained result sign bit; some
+  out-of-range intermediates wrap instead of saturating.
+- ISA G1 completion observes hidden `g1_done`, not both norms. G4's full-width
+  first-tile wait joins their output buffers, but `STATE G1; HALT` is not itself
+  a general completion barrier for unequal norm latencies.
+- G4's INT32-to-INT16 rounding adds the bias in INT32, so values near INT32_MAX
+  can wrap before clamping. This applies to both output-conversion paths.
+
 
 ### Top-Level Datapath & System Wiring
 
@@ -56,27 +100,28 @@ DATAPATH PIPELINE                                                               
         |                                                                             |
         v                                                                             |
  +-------------------------------------+                                              |
- | G1: Input RMSNorm + Projection     |                                              |
- |   - rmsnorm_block.sv (u_rmsnorm_g1) |                                              |
+ | G1: Hidden / Embedding RMSNorm      |                                              |
+ |   - two rmsnorm_block instances     |                                              |
+ +-------------------------------------+                                              |
+        | R1: [embedding_norm, hidden_norm]                                           |
+        v                                                                             |
+ +-------------------------------------+                                              |
+ | G4: QKV Projection                 |                                              |
  |   - gemv_stage_array_scaled_slr.sv  |<---------------------------------------------+
  +-------------------------------------+                                              |
         | Q, K, V activations                                                         |
         v                                                                             |
  +-------------------------------------+                                              |
- | G4/G5: RoPE & KV Cache Append       |                                              |
- |   - g4_qkv_seam.sv                  |                                              |
+ | G5: RoPE, KV Append & Attention    |                                              |
+ |   - selected-head QKV requant      |                                              |
  |   - rope_layer.sv (rope_pair_rotate)|                                              |
  |   - multihead_kv.sv / kv_head_wide  |                                              |
  +-------------------------------------+                                              |
-        | Q, K, V vectors                                                             |
+        | Attention output                                                            |
         v                                                                             |
  +--------------------------------------------------------------------+               |
- | G6: Multi-Head Attention Engine                                    |               |
- |   - attention_head_assembly_perbank_sbuf.sv / attention_full_mha   |               |
- |   - attn_score_dot.sv      (Q * K^T dot product)                   |               |
- |   - softmax_exp_sum.sv     (exponentiation & sum)                  |               |
- |   - attn_v_combine.sv      (Score * V weighted sum)                |               |
- |   - residual_add.sv        (Attention output + residual)           |               |
+ | G6: Attention Output Projection                                    |               |
+ |   - gemv_stage_array_scaled_slr.sv                                 |<--------------+
  +--------------------------------------------------------------------+               |
         | Hidden states                                                               |
         v                                                                             |

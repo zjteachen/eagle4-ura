@@ -222,17 +222,17 @@
 `define EAGLE4_BACK_SEQ           1'b1
 
 // =====================================================================
-// GEMV CORE (2-bit x fp16 mixed precision)
+// GEMV CORE (packed 2-bit weights, INT16 activations, fixed-point scales)
 // =====================================================================
-// [A] GEMV_SCALED | 1 = gemv_stage_array_scaled (per-group fp16 GPTQ dequant on DSP58, Q3.13) | netlist: DSP48E2/DSP58 scale multipliers present per lane group
+// [A] GEMV_SCALED | multiply each integer group sum by its signed fixed-point scale; GEMV_SCALE_FRAC gives the fractional width
 `define EAGLE4_GEMV_SCALED        1'b1
 // [A] DUAL_PORT | TDP dual-read GEMV (Stage-B', WO-025): 0 = single-port (default, bit+cyc identical), 1 = 2 chunks/cyc via URAM port B (gemv_lane_scaled_stream_dual + RD_PORTS=2, WLAT-fixed) -> per-col cyc halves. Requires body seams to source a_chunk_b. | netlist: URAM288 port-A AND port-B RDB_WR active on weight banks AND URAM COUNT UNCHANGED (8-3971 replication trap) AND seam->lane FDRE depth port-A==port-B
 `define EAGLE4_DUAL_PORT          `DUAL_PORT_V
-// [A] GEMV_SCALE_FRAC | dequant fixed-point fraction bits (13 => Q3.13, memory #169 population-best) | netlist: 13-bit right-shift constant on the scale path
+// [A] GEMV_SCALE_FRAC | scale fractional width; the top removes these bits after scaled accumulation
 `define EAGLE4_GEMV_SCALE_FRAC    13
 // [A] GEMV_KPAR64 | 1 = K_PAR=64 wide-bank array (ILLEGAL with GEMV_SCALED=1, $error :1485) | netlist: gemv_stage_array_uram_kpar64 instance name
 `define EAGLE4_GEMV_KPAR64        1'b0
-// [B] GPTQ_QZERO_RAW | raw GPTQ zero-point code (2'b01) | netlist: 2-bit constant on the (w - z) subtractor
+// [B] GPTQ_QZERO_RAW | decoded weight = raw_weight - (GPTQ_QZERO_RAW + 1); 2'b01 selects raw_weight - 2
 `define EAGLE4_GPTQ_QZERO_RAW     2'b01
 // [A] BODY_BATCH_B | body batch factor (B=1: batch is the DEPTH line, not the speed line; B>1 costs +233K LUT/unit) | netlist: B copies of the body accumulator set
 `define EAGLE4_BODY_BATCH_B       1

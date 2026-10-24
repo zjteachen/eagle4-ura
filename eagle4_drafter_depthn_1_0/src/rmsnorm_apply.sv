@@ -1,23 +1,10 @@
-// =====================================================================
-// rmsnorm_apply.sv
-// RMSNorm phase 3: stream-multiply x × scale × gamma in Q4.12.
-// =====================================================================
-//
-// Per cycle on `en`:
-//   for i in 0..K_PAR-1:
-//     stage A: x_scaled[i] = sat_q12((x[i] * scale_q12) >> 12)
-//     stage B: out[i]      = sat_q12((x_scaled[i] * gamma[i]) >> 12)
-//
-// Caller pre-loads `scale_q12` from rmsnorm_scale_int, then streams
-// (x_chunk, gamma_chunk) pairs over H/K_PAR cycles.
-//
-// 2-stage pipeline: ~3-cycle latency (input → output).
-//
-// Cost (K_PAR=16):
-//   - 16 × DSP58 for stage A multiplies
-//   - 16 × DSP58 for stage B multiplies
-//   - 2 sat_q12 LUTs per lane × 16 = ~150 LUT
-// =====================================================================
+// Two registered multiply stages per lane:
+//   A: shift x*scale by SCALE_SHR into an XS_WIDTH-bit intermediate.
+//   B: shift intermediate*gamma by 12 and saturate to INT16.
+// Gamma has 12 fractional bits; the scale convention is set by the caller.
+// out_chunk changes after two register stages; valid is en delayed by three
+// registers, one cycle later than the corresponding data. For aligned output
+// capture, use rmsnorm_block.out_chunk_strobe instead.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -26,26 +13,9 @@
 module rmsnorm_apply #(
     parameter int K_PAR     = 16,
     parameter int A_WIDTH   = 16,
-    // rmsnorm_fullh (2026-05-23): the scale-apply right-shift. Legacy = 12
-    // (scale_q12 is Q4.12, a dimensionless gain ≤ 8.0). For small-RMS stages
-    // (e.g. G1 input-embedding, RMS≈0.05 → gain≈20) the dimensionless gain
-    // exceeds the Q4.12 ceiling, so the scale engine emits a Q(4+B).(12-B)
-    // scale (B = headroom bits) and this first-stage shift is (12-B). The
-    // ×gamma stage stays Q4.12 (gamma is Q4.12) so the OUTPUT remains Q4.12.
-    // SCALE_SHR=12 reproduces the legacy datapath bit-for-bit (B=0).
+    // Fractional bits removed from x*scale; G1 uses 10.
     parameter int SCALE_SHR = 12,
-    // G1_SATURATION_FIX (2026-05-26): width of the stage-A x_scaled intermediate.
-    // The product (x·scale)>>SCALE_SHR was previously clamped to A_WIDTH=16 bits
-    // (Q-format with only ~1 integer bit at the G1 SCALE_SHR=10), so the 4
-    // largest-magnitude pre-norm hiddens (|x_scaled| up to 65312 on seed-42 G1)
-    // SATURATED at ±32767, collapsing g1_h_norm at exactly those 4 elements.
-    // Widening x_scaled to XS_WIDTH bits adds (XS_WIDTH-16) integer bits of
-    // headroom so the intermediate no longer clips; the ×gamma stage-B output is
-    // still saturated to A_WIDTH, so the OUTPUT Q-format is UNCHANGED (the gamma
-    // stage's >>12 + sat_q16 keeps the seam at the same frac). XS_WIDTH=A_WIDTH
-    // reproduces the legacy datapath bit-for-bit. 18 covers all observed seeds
-    // (max needed = 17 bits @ seed-42/seed-7 G1) with one bit of margin; cost is
-    // a 2-bit-wider register + DSP operand (~0 LUT/0 URAM/0 DSP delta).
+    // Width of stage-A x_scaled; output remains A_WIDTH after gamma.
     parameter int XS_WIDTH = A_WIDTH,
     parameter int SCALE_WIDTH = 16
 ) (
@@ -58,22 +28,16 @@ module rmsnorm_apply #(
     output logic signed [K_PAR*A_WIDTH-1:0]  out_chunk,
     output logic                             valid
 );
-
-    // Stage-A/Stage-B product widths.
+    // Product widths: PS_WIDTH for x×scale and PB_WIDTH for x_scaled×gamma.
     localparam int PS_WIDTH = A_WIDTH + SCALE_WIDTH;
     localparam int PB_WIDTH = XS_WIDTH + A_WIDTH;
 
-    // Q4.12 saturating round-shift at the legacy fixed 12 (used for ×gamma).
-    // Output is A_WIDTH (16-bit) — this is the single saturation point that sets
-    // the seam Q-format, so widening XS_WIDTH does NOT change the output frac.
+    // Gamma multiply: arithmetic truncation by 12 bits, then INT16 saturation.
+    // No rounding bias is added.
     function automatic signed [A_WIDTH-1:0] sat_q12;
         input signed [PB_WIDTH-1:0] v;
         begin
-            // valid output occupies bits [A_WIDTH+12-1 : 12]. Overflow check:
-            // bits [PB_WIDTH-1 : A_WIDTH+12-1] (the guard bits INCLUDING the
-            // result MSB) must all equal the sign bit, else saturate. For
-            // PB_WIDTH=32/A_WIDTH=16 this is v[31:27] — bit-identical to the
-            // legacy check.
+            // The shifted A_WIDTH result is valid only when all guard bits match sign.
             if (v[PB_WIDTH-1 : A_WIDTH+12-1] != {(PB_WIDTH-(A_WIDTH+12-1)){v[PB_WIDTH-1]}})
                 sat_q12 = v[PB_WIDTH-1] ? 16'sh8000 : 16'sd32767;
             else
@@ -81,12 +45,9 @@ module rmsnorm_apply #(
         end
     endfunction
 
-    // Parameterized saturating right-shift by SCALE_SHR for the x×scale stage.
-    // Result is carried at XS_WIDTH bits (>= A_WIDTH) so the stage-A intermediate
-    // has (XS_WIDTH-A_WIDTH) extra integer bits of headroom and no longer clips
-    // the few large-magnitude elements (G1_SATURATION_FIX). Guard bits
-    // [31 : SCALE_SHR+XS_WIDTH] must all equal the sign bit, else saturate to the
-    // XS_WIDTH-bit signed range.
+    // Stage-A overflow guard excludes the retained result's sign bit.
+    // Values just outside the signed XS_WIDTH range can wrap rather than clamp.
+    // Preserve this current behavior until an explicit arithmetic fix.
     localparam signed [XS_WIDTH-1:0] XS_MAX =  (1 <<< (XS_WIDTH-1)) - 1;
     localparam signed [XS_WIDTH-1:0] XS_MIN = -(1 <<< (XS_WIDTH-1));
     function automatic signed [XS_WIDTH-1:0] sat_scale;

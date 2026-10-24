@@ -1,61 +1,12 @@
 // =====================================================================
-// gemv_lane_scaled_stream_dual.sv      (WO-025 — dual-read-port GEMV lane)
+// gemv_lane_scaled_stream_dual.sv — dual-port scaled GEMV lane
 // =====================================================================
-//
-// 32-MAC/cycle scaled GEMV lane. The bit-exact analogue of
-// gemv_lane_scaled_stream that consumes TWO K-chunks per cycle (the EVEN
-// chunk via URAM port A, the ODD chunk via URAM port B), so the per-column
-// active-cycle count halves: ceil(nc/2) instead of nc.
-//
-// WHY THIS IS THE WO-025 LEVER (project_dualreadport_uram_gemv_lever):
-//   The GEMV is URAM-READ-PORT bound: one K_PAR-wide row = one chunk per
-//   cycle is the per-column throughput cap, NOT DSP (4-8/lane) or activation
-//   fanout. URAM288 on V80 is true-dual-port and port B is IDLE during
-//   compute. Driving port B as a 2nd compute read fetches 2 chunks/cycle =
-//   2*K_PAR weights/cycle with the SAME URAM block count.
-//
-// =====================================================================
-// BIT-EXACTNESS  (the hard requirement — feedback_no_accuracy_tradeoff)
-// =====================================================================
-// The reference per-group INT partial sum is
-//     gsum_g = Σ_{chunk c ∈ group g}  ( Σ_i a[c][i]·w_s[c][i] )
-// and the scaled output is  out = Σ_g  gsum_g · scale_g.
-//
-// This lane computes, EACH cycle, csa_e (= Σ_i a[even][i]·w_s[even][i]) and
-// csa_o (= Σ_i a[odd][i]·w_s[odd][i]) with TWO independent 16-MAC + Wallace
-// CSA datapaths (csa_tree16_int20, identical to the single-port lane's), then
-// folds  group_acc += csa_e + csa_o. Because INT addition is associative and
-// commutative, summing the chunks two-at-a-time gives the IDENTICAL gsum_g as
-// summing them one-at-a-time. The scale multiply happens ONCE per group on the
-// full INT group sum (same DSP58 INT-mode slot, same pipelined scale_now), so
-// scaled_acc is byte-for-byte identical to the single-port lane.
-//
-// GROUP-BOUNDARY ALIGNMENT (why a pair never straddles two scales):
-//   CPG = GROUP/K_PAR chunks per group. For EVEN CPG (production: 128/16 = 8),
-//   chunks 2p and 2p+1 share the same group for every pair p (2p+1 crosses a
-//   CPG boundary only when 2p ≡ CPG-1 mod CPG, impossible for even 2p). So both
-//   members of a cycle's pair carry the SAME group/scale — the "fold then one
-//   scale" reduction is exact. CPG odd is UNSUPPORTED (synthesis guard below);
-//   the EAGLE4 datapath is always CPG=8.
-//
-// ODD nc / PARTIAL FINAL GROUP:
-//   The FSM walks ceil(nc/2) pairs. On the final pair when nc is odd, the ODD
-//   chunk index == nc (out of range) → its MAC is MASKED to 0 (a_odd forced 0)
-//   so csa_o contributes nothing. The flush "last chunk of group" test is
-//   computed against the CLAMPED group end min((g+1)*CPG-1, nc-1), so a partial
-//   final group still flushes on its true last valid chunk. (Production nc =
-//   16/192/384/512 are all multiples of CPG=8 → every group full, even nc.)
-//
-// LATENCY (start → done) and the SCALE alignment match the single-port lane's
-// idiom exactly: caller drives scale_q for the CURRENT group (aligned to
-// group_idx_out), the lane pipelines it CSA_LAT deep and applies it at flush.
-// The activation for BOTH chunks of a pair is supplied by the caller off the
-// exposed chunk_idx_out (even) and chunk_idx_b_out (odd) — same combinational
-// fetch idiom as the single-port lane, just 2-wide.
-//
-// REGRESSION: instantiated ONLY when the array's DUAL_PORT=1. DUAL_PORT=0 uses
-// the unchanged single-port gemv_lane_scaled_stream, so the existing g6 / perbank
-// / cycle-measure contracts are untouched.
+// Consumes even and odd K_PAR chunks per cycle through two integer MAC/CSA
+// paths. Pair sums are folded into each GROUP partial sum, then one signed
+// fixed-point scale multiply is applied at the group boundary. CPG must be
+// an even power of two: pair boundaries share a scale and indexing uses shifts.
+// Odd terminal counts mask the out-of-range odd member. WLAT=1 delays both
+// weights and tags by one cycle for a registered activation seam.
 // =====================================================================
 
 `timescale 1ns/1ps
@@ -70,16 +21,8 @@ module gemv_lane_scaled_stream_dual #(
     parameter int SCALE_WIDTH = 16,       // signed scale
     parameter int SCALE_FRAC  = 15,       // fractional bits (informational)
     parameter int RES_WIDTH   = 48,       // scaled fixed-point accumulator width
-    // WLAT (Stage-B' D1 activation-seam fix for the DUAL lane): mirror of the
-    // single lane's WLAT. On the SLR_SAFE seam the activation (a_chunk/a_chunk_b)
-    // arrives ONE register deeper than the weights (qw_word/qw_word_b), so at
-    // WLAT=0 the dual lane computes W[pair]·act[pair-1] on the body GEMV (the D1
-    // stale-by-1 class). WLAT=1 delays BOTH weight chunks + the MAC enable + the
-    // per-pair issue index (group tag + odd-mask) + scale_q by ONE cycle so the
-    // (already +1-deeper) activation and the delayed weights meet. BIT-EXACT: all
-    // operands and their tags shift by the SAME 1 cycle; the extra cycle is
-    // absorbed by S_DRAIN (CSA_LAT+2 margin). WLAT=0 = legacy (bit+cycle identical
-    // to the isolation-proven dual lane).
+    // WLAT=1 delays both weight words, valid/tag, odd-mask index, and scale
+    // by one cycle to match the registered activation seam.  WLAT=0 is direct.
     parameter bit WLAT        = 1'b0,
     parameter int N_CHUNKS    = K / K_PAR,
     parameter int CW          = (N_CHUNKS <= 1) ? 1 : $clog2(N_CHUNKS + 2),
@@ -105,9 +48,7 @@ module gemv_lane_scaled_stream_dual #(
     // Per-group dequant scale, held for the CURRENT group
     input  wire signed [SCALE_WIDTH-1:0]   scale_q,
 
-    // RUNTIME terminal chunk count for the FSM walk (G12_K_PATH FIX-1 idiom).
-    // The lane is ELABORATED for the worst-case K_MAX (N_CHUNKS) but only walks
-    // n_chunks_run chunks per start; 0 -> full N_CHUNKS (unconnected-safe).
+    // Runtime terminal chunk count, latched at start; zero selects N_CHUNKS.
     input  wire        [CW-1:0]            n_chunks_run,
 
     // FSM exposes the EVEN chunk index it expects (port A); the ODD index
@@ -125,7 +66,7 @@ module gemv_lane_scaled_stream_dual #(
 
     // Final UNSCALED INT32 accumulator (debug; == single-port lane's acc_out).
     output reg  signed [31:0]              acc_out,
-    // Final SCALED fixed-point accumulator (Q with SCALE_FRAC frac bits).
+    // Scaled result retains activation fractional bits plus SCALE_FRAC.
     output reg  signed [RES_WIDTH-1:0]     result_q,
     output reg                             done
 );
@@ -220,12 +161,8 @@ module gemv_lane_scaled_stream_dual #(
     assign group_idx_next_out = grp_next_full[GW-1:0];
 
     // ----------------------------------------------------------------
-    // WLAT (D1 dual-lane seam fix): delay BOTH weight chunks + MAC enable +
-    // the per-pair issue index (group tag + odd-mask) + scale_q by ONE cycle
-    // to meet the +1-deeper SLR-seam activation. Pass-through at WLAT=0
-    // (bit+cycle identical to the isolation-proven dual lane). chunk_idx_out /
-    // group_idx_out stay UNDELAYED (the caller's fetch index; the seam adds the
-    // register externally) — same idiom as the single lane.
+    // WLAT=1 delays both weights, valid/tag, odd-mask index, and scale together
+    // so the deeper activation seam remains aligned.  WLAT=0 is pass-through.
     // ----------------------------------------------------------------
     wire [31:0]                   qw_word_eff, qw_word_b_eff;
     wire                          mac_in_valid;

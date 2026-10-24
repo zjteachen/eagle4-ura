@@ -1,28 +1,10 @@
-// =====================================================================
-// rmsnorm_sumsq.sv
-// Streaming K_PAR=16-wide sum-of-squares accumulator for RMSNorm phase 1.
-// =====================================================================
+// Streaming sum-of-squares accumulator for K_PAR lanes.
+// Each en request squares the current chunk, reduces the lanes, and adds the
+// result to the 64-bit running sum. clear resets the running sum.
 //
-// Per cycle (on `en`): squares 16 input elements, adds to running sum.
-// After H/K_PAR cycles of `en`, `sumsq_out` holds Σ x[i]² for i=0..H-1.
-//
-// On `clear`: sumsq_out → 0.
-//
-// Output width 64-bit: max |x[i]|=32768, squared=2^30, summed H=3072 times
-// = 2^42 ≈ 4.4 TB. Fits in 48-bit, use 64-bit for safety margin.
-//
-// Pipeline:
-//   stage A (1 cyc): per-lane square (16 × DSP58)
-//   stage B (1 cyc): tree-reduce 16 squares to one sum_chunk
-//   stage C (1 cyc): accumulate sum_chunk into running sumsq
-//
-// Total per H=3072: 3 + 192 = 195 cycles + drain = ~200 cycles
-//   ≈ 0.74 µs at 270 MHz.
-//
-// Cost:
-//   16 × DSP58 (signed×signed squarers)
-//   ~256 LUT for tree-reduce + 64-bit accumulator
-// =====================================================================
+// Three registered stages separate lane products, reduction, and accumulation;
+// en_a/en_b carry the request through those stages. For A_WIDTH=16 and H=3072,
+// the mathematical maximum is H×2^30 < 2^42, within the 64-bit output.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -40,7 +22,7 @@ module rmsnorm_sumsq #(
     output logic [63:0]                      sumsq_out
 );
 
-    // Stage A: per-lane squares (combinational mults from x_chunk)
+    // Stage A: register per-lane signed 32-bit squares.
     logic signed [31:0] sq [0:K_PAR-1];
     logic               en_a;
     always_ff @(posedge clk) begin
@@ -57,8 +39,7 @@ module rmsnorm_sumsq #(
         end
     end
 
-    // Stage B: tree-reduce 16 squares to one sum (5 levels of pairs)
-    // 16→8→4→2→1, each level combinational
+    // Stage B: sum the registered squares into a 64-bit chunk total.
     logic [63:0] sum_chunk;
     logic        en_b;
     always_ff @(posedge clk) begin

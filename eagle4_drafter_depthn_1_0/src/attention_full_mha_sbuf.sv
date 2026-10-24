@@ -93,22 +93,11 @@ module attention_full_mha_sbuf #(
     //       assembly's extra drain state (done still co-aligns out_vec).
     // -----------------------------------------------------------------
     parameter bit COMBINE_LOCAL    = 1'b1,
-    // -----------------------------------------------------------------
-    // W3-F2 (LUT_FF_MAXOUT_DISCOVERY F2 / ARCH_ONETIME_PACKAGE L1):
-    // requant AFTER the 24:1 head mux, not before it.
-    //   RAW_REQUANT=0 (DEFAULT): legacy — consume the pre-requanted INT16
-    //       q_in/k_in/v_in (the g4_qkv_seam output, 9,216 parallel rsh_sat
-    //       units upstream). Bit+cycle identical to the golden.
-    //   RAW_REQUANT=1: consume the RAW INT32 q/k/v_raw_buf tiles, head-mux
-    //       them 24:1 FIRST (2x-wide mux — the honest added cost), then
-    //       requant ONLY the selected head's 3x128 lanes (384 rsh_sat units
-    //       instead of 9,216). rsh_sat is applied per element, so
-    //       mux(rsh_sat(x)) == rsh_sat(mux(x)) — BIT-EXACT by commutation,
-    //       zero latency change (the path stays combinational; q_head is
-    //       consumed via registered FSM latches exactly as before).
-    //   The producer (attn_stage_wrap) must then NOT instantiate
-    //   g4_qkv_seam — that removal is the ~370-400K LUT relief.
-    // -----------------------------------------------------------------
+    // RAW_REQUANT=0 consumes pre-requantized packed INT16 Q/K/V vectors.
+    // RAW_REQUANT=1 selects a head from the raw INT32 buffers, then applies
+    // the G4_FRAC->G5_FRAC round/shift/clamp conversion to that head only.
+    // The top-level REQUANT_HEADMUX parameter selects this path and omits
+    // the parallel full-vector g4_qkv_seam conversion.
     parameter bit RAW_REQUANT      = 1'b0,
     // HEAD_PAR — G5 head-parallelism (ported from speedwave_v2_g5mem, Stage-A).
     // 1 = SERIAL (DEFAULT): ONE assembly time-muxes all N_HEADS (the ps_tree_fsm
@@ -211,9 +200,7 @@ module attention_full_mha_sbuf #(
     input  wire signed [OUT_W-1:0]    k_in,
     input  wire signed [OUT_W-1:0]    v_in,
 
-    // W3-F2 RAW INT32 tile inputs (consumed ONLY when RAW_REQUANT=1; a legacy
-    // caller ties them to '{default:'0}). Same S2 capture format as
-    // g4_qkv_seam.sv:44-46 — 24 col-tiles x 128 INT32 lanes, GEMV frac=G4_FRAC.
+    // Per-head raw INT32 Q/K/V buffers, used only with RAW_REQUANT=1.
     input  wire signed [32*D_HEAD-1:0] q_raw_buf [0:N_HEADS-1],
     input  wire signed [32*D_HEAD-1:0] k_raw_buf [0:N_HEADS-1],
     input  wire signed [32*D_HEAD-1:0] v_raw_buf [0:N_HEADS-1],
@@ -279,16 +266,14 @@ module attention_full_mha_sbuf #(
     wire signed [ROW_W-1:0] q_head, k_head, v_head;
 
     generate if (!RAW_REQUANT) begin : g_head_int16
-        // legacy: 24:1 mux on the pre-requanted INT16 vectors (bit+cycle
-        // identical to the shipped golden).
+        // Select a head from the already converted INT16 vectors.
         assign q_head = q_in[head_sel*ROW_W +: ROW_W];
         assign k_head = k_in[head_sel*ROW_W +: ROW_W];
         assign v_head = v_in[head_sel*ROW_W +: ROW_W];
     end else begin : g_head_raw
-        // W3-F2: 24:1 mux on the RAW INT32 tiles, then 3x128 rsh_sat.
-        // rsh_sat VERBATIM from g4_qkv_seam.sv:57-66 (round-half, arith >>,
-        // INT16 sat) — the requant CONTRACT is unchanged, only its position.
-        localparam int SHR = G4_FRAC - G5_FRAC;   // = 2 (C1-REVERT, wrap :90-92)
+        // Select before requantization to share the converters across heads.
+        // As in g4_qkv_seam, the 32-bit rounding add can wrap near INT32_MAX.
+        localparam int SHR = G4_FRAC - G5_FRAC;   // requires SHR >= 1
         function automatic logic signed [A_WIDTH-1:0] rsh_sat;
             input signed [31:0] v;
             logic signed [31:0] r;

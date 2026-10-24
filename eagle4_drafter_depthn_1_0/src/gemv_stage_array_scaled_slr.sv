@@ -1,132 +1,21 @@
 // =====================================================================
-// gemv_stage_array_scaled_slr.sv   (PDI#6 SLR-SAFE scaled GEMV array)
+// gemv_stage_array_scaled_slr.sv — SLR-aware scaled GEMV array
 // =====================================================================
-// SLR-crossing-safe wrapper for the SCALED K_PAR=16 GEMV array.
-//
-// PROBLEM (reports/PDI6_TIMING_RISK_20260526.md, Task 2):
-//   The full drafter's weight URAM is bit-floor-bound at 1,536 URAM (>677,
-//   the largest V80 SLR), so the lane array is FORCED to span all 3 SLRs.
-//   In the closing PILOT the activation broadcast `a_chunk` (fo=767) crossed
-//   SLR1->SLR2 COMBINATIONALLY: 3.362 ns on a single net, 82% route, pinning
-//   the worst setup path at WNS = 0.000 @ 125 MHz (the wall). The full merge
-//   adds +348 URAM into the same near-full SLRs -> that zero-margin path goes
-//   negative if the broadcast stays combinational.
-//
-// THE FIX (this module — the SCALED analogue of gemv_array_slr_pipelined):
-//   The lanes are structurally INDEPENDENT along N (output columns): the only
-//   shared input is the activation broadcast (`a_chunk` + control + qz +
-//   stage_sel + tile_idx + start), and the ONLY way out is each lane's own
-//   acc_out / result_q (read ONE-AT-A-TIME by the downstream 128:1 tree scan
-//   / requant — never a combinational cross-lane reduce). So we:
-//     1. Partition the LANES into N_GROUPS, one per SLR (the future Pblock
-//        target via the per-group keep_hierarchy handle g_grp[N]).
-//     2. REGISTER every signal that crosses a group boundary: the broadcast
-//        bus (one PIPE_STAGES-deep replica per group, `keep`/`dont_touch` so
-//        the optimizer cannot merge the replicas back into one combinational
-//        SLL hop) AND the per-lane outputs on the way back.
-//   A registered SLL hop's delay leaves the setup window (absorbed as latency,
-//   not a longer combinational path) -> the array closes with the SAME
-//   arithmetic, just +PIPE_STAGES in + +PIPE_STAGES out latency.
-//
-// SLR_SAFE PARAM:
-//   SLR_SAFE=0 (default): PASSTHROUGH. Wires the broadcast + outputs straight
-//     to/from the lanes (PIPE_STAGES effectively 0). Bit-AND-cycle identical
-//     to gemv_stage_array_scaled — the existing g6 contract / regression home.
-//   SLR_SAFE=1: registers the broadcast + returns PIPE_STAGES deep per group.
-//     Numerically BIT-IDENTICAL to SLR_SAFE=0, exactly +2*PIPE_STAGES cycles
-//     of latency (PIPE forward on the broadcast + PIPE back on the outputs).
-//
-// WHY BIT-EXACT (the latency-symmetry argument, same as the unscaled wrapper):
-//   `gemv_lane_scaled_stream` is SELF-TIMED: its FSM advances off its own
-//   chunk_idx counter, started by `start`. The weight URAM read uses the lane's
-//   own chunk_idx_next (1-cyc lookahead); the scale BRAM read uses the lane's
-//   own group_idx_next. When SLR_SAFE=1 delays `start` AND `a_chunk` (and
-//   qz/stage/tile) by the SAME PIPE_STAGES, the lane starts PIPE_STAGES later
-//   and its self-timed walk consumes the IDENTICAL (activation, weight, scale)
-//   triples in the IDENTICAL order -> identical per-group INT partial sums ->
-//   identical scaled accumulate -> identical result_q / acc_out. The return
-//   registers only delay WHEN result_q is sampled downstream (gated by the
-//   registered `done`). Pure delay line: changes WHEN, never WHAT.
-//
-//   NOTE on the scale-BRAM lookahead: scale_q is supplied by the per-lane
-//   scale_bram addressed by the lane's OWN group_idx_next — it is NOT part of
-//   the cross-SLR broadcast (each lane has its own bank). So the scale path is
-//   intra-lane (intra-SLR) and needs no seam register; only the shared
-//   broadcast + the per-lane outputs cross die cuts. Delaying `start` shifts
-//   the lane's group_idx walk in lockstep with the delayed activation, so the
-//   scale read stays aligned automatically (same self-timing as the weights).
-//
-// MULTI-DRIVER SAFETY (feedback_axi_driver_fanin_rule): NO new AXI master.
-//   Re-times existing internal fabric nets only. The URAM weight banks + BRAM
-//   scale banks stay per-lane single-read-port (1 driver each). The weight-load
-//   and scale-load write ports are boot-time, single-writer, and are NOT
-//   registered through the seams (they are not on the per-step broadcast).
-//
-// FSM dwell (correctness when integrated): the upstream FSM samples
-//   acc_out/result_q/done/chunk_idx_valid. SLR_SAFE=1 shifts the
-//   accumulate-complete -> output-valid relationship by 2*PIPE_STAGES cycles.
-//   The integrating FSM's per-stage dwell counters must absorb +2*PIPE_STAGES
-//   (the done-driven handshake auto-extends, like pdi5_safe). This wrapper
-//   changes ONLY timing, never the arithmetic.
-// =====================================================================
-//
-// ---------------------------------------------------------------------
-// PREFETCH_COL — column double-buffer (GEMV_COL_DOUBLE_BUFFER, 2026-06-03)
-// ---------------------------------------------------------------------
-// MEASURED BASELINE (tb_gemv_cycle_measure, SLR_SAFE=1 golden config):
-//   per-column start->done = nc + 9, where nc = K/16 (S_RUN active cycles)
-//   and the 9-cycle tail = forward-seam(+1) + S_IDLE->S_RUN(+1) + CSA drain
-//   (CSA_LAT+2=5) + scaled-flush/output-reg + return-seam, of which the
-//   inter-column SETTLE+HANDSHAKE bubble is the reclaimable part. G12_lm
-//   (nc=16) measures 25 cyc and is 79% of all dead cycles (1,002 short cols).
-//
-// WHAT THIS DOES (resource-neutral, bit-exact, DEFAULT OFF):
-//   When PREFETCH_COL=1 the wrapper SELF-SEQUENCES a contiguous run of
-//   `n_cols` output columns starting at the caller's `tile_idx`: it owns the
-//   per-column `start` and the bank `col_offset`, and PRE-STAGES column c+1's
-//   `tile_idx` into the weight-bank/scale-bank `col_offset_acc` registers
-//   DURING column c's CSA drain (the dead window where the lanes read no new
-//   weights), then re-pulses the lane `start` the cycle the lanes return to
-//   S_IDLE. This removes the inter-column settle (the registered
-//   col_offset_acc 1-cycle update, the same hazard eagle4_drafter works around
-//   with array_start_fsm_q) AND the caller's done->re-issue round-trip, so
-//   back-to-back columns no longer pay the refill bubble between them.
-//
-// WHY IT IS BIT-EXACT (same latency-symmetry argument as SLR_SAFE):
-//   Each lane is the UNCHANGED self-timed gemv_lane_scaled_stream. For a given
-//   column it consumes exactly nc (activation, weight, scale) triples in
-//   chunk_idx order, started by its own `start`. PREFETCH_COL only changes
-//   WHEN the next column's `start` fires and WHEN that column's col_offset_acc
-//   settles — never WHICH triples a column sees (col_offset_acc for column c+1
-//   is advanced only AFTER column c has left S_RUN, so column c's weight/scale
-//   reads are untouched; the lane re-enters S_RUN for c+1 only after its `done`
-//   for c). Pure control re-timing of the column boundary. The per-lane INT
-//   partial sums, the per-group scaled accumulate, and result_q/acc_out are
-//   byte-for-byte identical to the one-column-at-a-time path; each column's
-//   result is emitted on its own `done` exactly as before (now `col_done`,
-//   tagged with `col_done_idx`).
-//
-//   IMPORTANT RESOURCE NOTE (the honest bound): the lanes share ONE URAM read
-//   port per bank (the golden is URAM-port-bound at 97.9%). A single datapath
-//   therefore CANNOT run column c+1's S_RUN while column c still drains — that
-//   would need a 2nd concurrent weight read (2nd URAM port = WO-025's separate
-//   lever, or a 2nd lane datapath = 2x DSP/URAM). So PREFETCH_COL hides the
-//   inter-column SETTLE+HANDSHAKE bubble (resource-neutral, bit-exact) but
-//   does NOT hide the intrinsic single-datapath CSA drain. Hiding the full
-//   9-cycle tail (the 25->16 ceiling) requires the dual-port / ping-pong path,
-//   which is out of this resource-neutral wrapper's scope.
-//
-// PREFETCH_COL=0 (default): the column-sequencer logic is compiled away; the
-//   wrapper is bit-AND-cycle identical to the existing single-column behavior
-//   (the cycle-measure / perbank-bit-exact regression home). The new ports
-//   (n_cols / col_done / col_done_idx / cols_done) are inert: start/tile_idx
-//   pass through, col_done == done, col_done_idx == tile_idx, cols_done == done.
+// Replicates activation/control per SLR group and instantiates one weight/scale
+// bank and integer GEMV lane per output column. SLR_SAFE=0 is passthrough;
+// SLR_SAFE=1 registers forward broadcast and return values.
+// PREFETCH_COL sequences contiguous columns when enabled. DUAL_PORT reads even
+// and odd chunks together; otherwise the single-port lane is used. BATCH_B>1
+// reuses one weight/scale read across sibling activation columns. FF_ACT_CACHE
+// adds a hub plus per-group activation register stage. WLAT delays lane
+// weight/valid/tag alignment for the registered activation seam.
+// All arithmetic is signed integer MAC plus fixed-point scale multiplication.
 // =====================================================================
 
 `timescale 1ns/1ps
 `default_nettype none
 
-// G12_K_PATH FIX-1: single-source per-stage chunk count (sg_w_chunks_per_col).
+// Shared per-stage chunk counts and bank geometry.
 `include "stage_geometry.svh"
 
 (* keep_hierarchy = "yes" *)
@@ -139,82 +28,31 @@ module gemv_stage_array_scaled_slr #(
     parameter int SCALE_WIDTH = 16,
     parameter int SCALE_FRAC  = 13,         // Q3.13 production
     parameter int RES_WIDTH   = 48,
-    // ---- BW-4 SIBLING-BATCH (FABLE_MASTER_PLAN §4 / DESIGN_PS_JEWEL §2.1 P0b) ----
-    // Arithmetic-intensity x B: each weight slice (qw_lane) and scale slice
-    // (scale_lane) is read from URAM/BRAM ONCE and MAC'd against BATCH_B
-    // sibling-node activation columns held in FF. Per lane => 1 weight read ->
-    // BATCH_B accumulators -> BATCH_B activation reads. Weights/scales are
-    // REUSED across the batch, so URAM/BRAM stay NEUTRAL; the cost is BATCH_B x
-    // the lane MAC datapath (LUT/FF/DSP) + BATCH_B x the FF activation columns.
-    //   BATCH_B=1 (DEFAULT): every batch block below is generate-guarded away ->
-    //     byte-AND-cycle identical to the silicon-proven array (the L0 A/B gate
-    //     + eagle4_drafter.sv diff anchor rely on this).
-    //   BATCH_B>1: SUPPORTED ONLY in the production seam config the engine uses
-    //     (SLR_SAFE=1, FF_ACT_CACHE=0, DUAL_PORT=0) — asserted below. The B-1
-    //     sibling activation columns ride the SAME forward seam registers as
-    //     a_chunk and the B-1 sibling results ride the SAME return-seam depth,
-    //     so every sibling is weight/scale/latency-aligned to b0 by construction.
+    // BATCH_B=1 compiles sibling datapaths away. Larger batches reuse one
+    // weight/scale read and are restricted by the elaboration guard below.
     parameter int BATCH_B     = 1,
     // ---- SLR-safe controls ----
     parameter bit SLR_SAFE    = 1'b0,       // 0 = passthrough, 1 = registered seams
     parameter int N_GROUPS    = 3,          // = #SLRs the array spans
     parameter int PIPE_STAGES = 1,          // registered hops per crossing
-    // ---- FF_ACT_CACHE — per-SLR FF activation cache (the FUNDAMENTAL SLR fix) ----
-    // When FF_ACT_CACHE=1 (with SLR_SAFE=1), the forward broadcast becomes a
-    // 2-STAGE pipe: STAGE 0 = a SINGLE SHARED HUB register (one replica of
-    // {a_chunk,a_chunk_b,qz,stage_sel,tile_idx,start}, pinnable to SLR1) and
-    // STAGE 1 = the PER-GROUP local replica (one per SLR). Each group's lanes then
-    // read a LOCAL FF copy and the only cross-SLR arc is a CLEAN point-to-point
-    // FF->FF hop (hub-FF SLR1 -> per-group-FF SLRk) instead of one global net
-    // fanning combinationally to 3 SLRs (the RCA's worst body path:
-    // g_bcast_pipe.g_grp_pipe[0].tile_idx_p_reg SLR0 -> a DSP58 SLR2).
-    //   Latency: forward = 2 (was 1). The chunk-index lookahead leads by 2 (vs 1)
-    //   so the consumer's combinational a_chunk fetch (off array_chunk_idx_out),
-    //   after the +2 forward seam, still lands at the lane aligned with weight[c].
-    //   The return path is registered the same total depth (2). BIT-EXACT to the
-    //   PIPE_STAGES=1 / FF_ACT_CACHE=0 path (same arithmetic, +1 forward latency
-    //   absorbed by the done-driven handshake).
-    //   FF_ACT_CACHE=0 (DEFAULT): the existing PIPE_STAGES code (lead-by-1,
-    //   per-group stage-0 latches a_chunk) — bit-AND-cycle identical to today.
-    // This param is gated to be a no-op unless SLR_SAFE=1 (the seam path).
+    // FF_ACT_CACHE adds a hub and per-group activation register stage.
+    // The extra forward stage is reflected in index lookahead and return depth.
     parameter bit FF_ACT_CACHE = 1'b0,
-    // ---- column double-buffer (GEMV_COL_DOUBLE_BUFFER) ----
-    parameter bit PREFETCH_COL = 1'b0,      // 0 = single-column (default, bit+cyc identical)
-                                            // 1 = self-sequence n_cols, prefetch col+1 in drain
-    // ---- WO-025 dual-read-port (2 chunks/cycle) ----
-    parameter bit DUAL_PORT = 1'b0,         // 0 = single-port lane (default, bit+cyc identical)
-                                            // 1 = drive idle URAM port B -> 2 chunks/cyc/lane
-    // ---- D1 activation-seam stale-by-1 fix (PDI#10, PDI10_D1_REGREAD_CONFIRM) ----
-    // WLAT=1 delays the WEIGHT word + the MAC enable by 1 cycle inside each lane,
-    // to compensate the EXTRA register the activation seam gains when its
-    // stage_io_buffer read is made REGISTERED (RD_LAT=1, the silicon BRAM truth).
-    // On silicon the forced-BRAM activation read adds a 1-cycle latency the comb
-    // model hid; WLAT=1 shifts the weight+enable by the SAME 1 cycle so the MAC
-    // pairs W[c]·act[c] (was W[c]·act[c-1]). WLAT=0 = legacy (bit+cyc identical).
-    // MUST be paired with RD_LAT=1 on every activation seam stage_io_buffer.
+    // Optional self-sequencing of contiguous output tiles.
+    parameter bit PREFETCH_COL = 1'b0,
+    // Optional second weight read and MAC path for two chunks per cycle.
+    parameter bit DUAL_PORT = 1'b0,
+    // WLAT=1 delays weight and MAC-valid by one cycle for a registered
+    // activation seam; pair it with the corresponding seam latency.
     parameter bit WLAT = 1'b0,
     // ---- derived ----
     parameter int N_CHUNKS    = K / K_PAR,
     parameter int CW          = (N_CHUNKS <= 1) ? 1 : $clog2(N_CHUNKS + 2),
     parameter int N_SGROUPS   = (K + GROUP - 1) / GROUP,
     parameter int GW          = (N_SGROUPS <= 1) ? 1 : $clog2(N_SGROUPS + 1),
-    // BANK_DEPTH must cover the FULL per-lane weight footprint across ALL stages
-    // = Sum(N/LANES * K/16) = 97,440 entries (G12_lm base alone is 81,408). The
-    // old 76*1024=77,824 was BELOW the G12 weight stage base, so every G12 weight
-    // read addressed mem[] OUT OF BOUNDS -> X -> all-x G12/TREE (the G12 X-HUNT
-    // silicon defect, 2026-06-06). 96*1024=98,304 >= 97,440 (= weight_bank_
-    // multistage default + documented footprint; the proven 1,884-URAM golden,
-    // 97.9% of 1,925). Pure capacity fix; no addressing/value change.
-    // (G12_LM_BANK_DEPTH_FIX, rescue_20260606)
-    // LANES-256 (2026-07-26): bank/scale GEOMETRY + depths now DERIVE from
-    // GEOM_LANES (default = LANES, so a strapped LANES=256 build cannot ship
-    // the 128-lane depths; per-lane footprint halves exactly —
-    // LANES256_GEMM_STUDY.md §1.1/§3). 128 -> 96K/16K (value-identical to
-    // the old literals = inert); 256 -> 48K/8K. A non-halved SCALE_DEPTH at
-    // 256 costs +1,024 RAMB36 = DEAD (study §6). GEOM_LANES is overridden
-    // ONLY by small pilot TBs (e.g. tb_gemv_dualport LANES=6 arrays pin
-    // GEOM_LANES=128 = the legacy behavior where bank geometry was fixed at
-    // 128 regardless of physical lane count); production NEVER overrides it.
+    // Per-lane capacity follows GEOM_LANES; small tests can override geometry
+    // independently of instantiated lane count. At 128 lanes, all stages need
+    // 97,440 weight words and 12,180 scale entries per lane.
     parameter int GEOM_LANES  = LANES,
     parameter int BANK_DEPTH  = (96 * 1024 * 128) / GEOM_LANES,
     parameter int SCALE_DEPTH = (16 * 1024 * 128) / GEOM_LANES,
@@ -225,8 +63,7 @@ module gemv_stage_array_scaled_slr #(
     parameter int RET_STAGES  = (SLR_SAFE && FF_ACT_CACHE) ? 2 : PIPE_STAGES,
     // # registered hops on the slowest in+out round trip (for callers/dwell)
     parameter int RT_DELAY    = SLR_SAFE ? (FF_ACT_CACHE ? 4 : (2 * PIPE_STAGES)) : 0,
-    // BW-4: number of SIBLING batch columns (0 when BATCH_B==1). All batch
-    // vectors are packed BB1-wide and are inert/unused at BATCH_B==1.
+    // Extra sibling columns; reserve one unused slot when BATCH_B==1.
     parameter int BB1         = (BATCH_B > 1) ? (BATCH_B - 1) : 1
 ) (
     input  wire                              clk,
@@ -235,9 +72,7 @@ module gemv_stage_array_scaled_slr #(
 
     // Activation broadcast (shared across all lanes) — registered when SLR_SAFE
     input  wire signed [K_PAR*A_WIDTH-1:0]   a_chunk,
-    // WO-025 dual-port: ODD-chunk activation (used only when DUAL_PORT=1; the
-    // caller drives it off chunk_idx_b_out, exactly as a_chunk off chunk_idx_out).
-    // Ignored when DUAL_PORT=0.
+    // Odd-chunk activation for DUAL_PORT; fetched using chunk_idx_b_out.
     input  wire signed [K_PAR*A_WIDTH-1:0]   a_chunk_b,
     // BW-4 sibling-batch activation columns (packed BB1 sets of one chunk each).
     // Fed off the SAME chunk index as a_chunk (all lanes lockstep). Inert when
@@ -271,8 +106,7 @@ module gemv_stage_array_scaled_slr #(
 
     // Lane status — chunk_idx_out from lane 0 (all lockstep)
     output wire        [CW-1:0]              chunk_idx_out,
-    // WO-025 dual-port: ODD-chunk index from lane 0 (== chunk_idx_out when
-    // DUAL_PORT=0). Caller fetches a_chunk_b = a_mem[chunk_idx_b_out].
+    // Odd-chunk index in dual-port mode; mirrors chunk_idx_out otherwise.
     output wire        [CW-1:0]              chunk_idx_b_out,
     output wire                              chunk_idx_valid,
 
@@ -473,32 +307,10 @@ module gemv_stage_array_scaled_slr #(
                 assign sr_g[gg] = eff_start;
             end
         end else if (!FF_ACT_CACHE) begin : g_bcast_pipe
-            // one registered replica of the broadcast bus per group (keep=true
-            // holds the per-SLR structural copies so they are NOT merged back
-            // into one net — which would re-create the combinational SLL hop we
-            // are removing). a_chunk_b (the WO-025 odd-chunk activation) rides
-            // the SAME seam so it stays aligned with a_chunk across the die cut.
-            //
-            // DURABLE G7g BCAST FIX (nextbuild_g7gbcast, 2026-07-06; ported to
-            // the tree_batch/WIDE lineage by kvrepl_port 2026-07-09): the prior
-            // `dont_touch="true"` on these replicas BLOCKED Vivado's fanout-driven
-            // replication, so a SINGLE per-group replica (e.g. g_grp_pipe[0].
-            // tile_idx_p_reg) fanned out to fo4816 loads and got placed straddling
-            // SLR0->SLR2 (a DSP58 in SLR2 read a control reg pinned in SLR0). That
-            // high-fanout cross-die net is STA-blind yet placement-sensitive =>
-            // the G7g INTERMITTENT silicon flake (run1 CRC 0xdb9ee1b6 wrong / run2
-            // golden). FIX = swap dont_touch -> max_fanout so each register is
-            // physically REPLICATED down to a small per-bank fanout; the placer
-            // then lands a LOCAL copy in each SLR/bank near its consumers, so no
-            // single broadcast net crosses an SLR. keep=true still prevents removal
-            // AND holds the 3 explicit per-group copies. Pure synthesis-attribute
-            // change: xsim-INVARIANT (attributes have no sim semantics) -> BIT- and
-            // CYCLE-identical (same PIPE_STAGES=1 seam depth, latency-NEUTRAL, no
-            // seam-latency/stale-by-1 class introduced). Mirrors the established
-            // codebase idiom `(* keep, max_fanout *)` (eagle4_drafter g1_rd_chunk_q).
-            // Narrow control/address regs (the fo4816 offenders: qz/stage_sel/
-            // tile_idx/start) get the tightest bound (per-bank); the wide 256b
-            // activation regs get a looser bound to cap FF replication cost.
+            // Per-group broadcast registers preserve control/data alignment.
+            // keep retains the explicit group copies; max_fanout permits
+            // further physical replication. Controls have tighter fanout
+            // bounds than the wider activation buses.
             (* keep = "true", max_fanout = 64 *)
             reg signed [K_PAR*A_WIDTH-1:0] a_chunk_p   [0:N_GROUPS-1][0:PIPE_STAGES-1];
             (* keep = "true", max_fanout = 64 *)
@@ -709,42 +521,10 @@ module gemv_stage_array_scaled_slr #(
             assign chunk_idx_b_out = lane_chunk_idx_b[0];      // == even idx when DUAL_PORT=0
             assign chunk_idx_valid = lane_chunk_valid[0];
         end else if (FF_ACT_CACHE) begin : g_idx_ffcache_lead2
-            // =============================================================
-            // FF_ACT_CACHE lead-by-2 lookahead. The forward seam (hub+local) is
-            // 2 registers deep, so the consumer's combinational a_chunk fetch off
-            // chunk_idx_out must lead the lane by 2 (vs +1 for PIPE_STAGES=1).
-            //
-            // ANCHORING (the bit-exactness crux — calibrated against the proven
-            // PIPE_STAGES=1 golden): in PIPE_STAGES=1 the FIRST fetch happens on
-            // the cycle the LANE sees its start (sr_g, = eff_start+1), exposing
-            // idx 0, then the exposed index rides the LANE's own chunk_idx_next.
-            // For FF_ACT_CACHE the lane's start (sr_g) is eff_start+2, and the
-            // first fetch must happen ONE cycle EARLIER than that (eff_start+1, =
-            // the hub-start cycle) so that — after the deeper +2 seam — act[c]
-            // still lands at the lane the cycle its counter==c. Concretely the
-            // required exposed schedule is idx(t)=t-1 over the cycle the hub start
-            // is high (idx 0) through NC cycles, which in STEADY STATE equals the
-            // lane's chunk_idx_next + 1 (= counter+2). We realize it with a small
-            // self-timed walk ANCHORED on the hub-start cycle (eff_start delayed
-            // ONE, == sr_hub timing in the forward seam) — the exact one-cycle-
-            // earlier analogue of PIPE_STAGES=1's sr_g anchor.
-            //
-            // NC = per-stage runtime chunk count (sg_w_chunks_per_col clamped to
-            // N_CHUNKS) — the SAME count the lane walks (grp_nc_run). The lane
-            // consumes one chunk/cycle with NO stalls in S_RUN, so a +1/cycle walk
-            // stays phase-locked. Sampled at the hub-start cycle off the pre-seam
-            // stage_sel delayed one (st_sel_hub) so it matches the stage the lane
-            // (started by the +2 sr_g) will actually run.
-            //
-            // BIT-EXACT: controls only WHICH activation the consumer fetches and
-            // WHEN; the +2 seam re-aligns it to the lane's weight[c] identically to
-            // how PIPE_STAGES=1's +1 lead re-aligns its +1 seam. The lane datapath
-            // (weights from its own counter, scale from its own group_idx) is
-            // untouched. n_chunks_run=0 (unconnected) -> full N_CHUNKS, like the lane.
-            // =============================================================
-            // hub-start + hub stage_sel: eff_start / stage_sel delayed ONE cycle,
-            // matching the STAGE-0 hub register of the forward seam (so the lead
-            // walk fires the cycle the hub latches, one cycle before sr_g).
+            // Two-stage forward seam: begin the activation walk at hub-start,
+            // one cycle before the lane sees start. Expose index 0 there, then
+            // advance each cycle for the latched per-stage chunk count.
+            // This path supports the single-port lane only.
             reg           eff_start_d1;   // == sr_hub timing
             reg  [3:0]    stage_sel_d1;   // pre-seam stage_sel, hub-aligned
             always_ff @(posedge clk) begin
@@ -802,10 +582,7 @@ module gemv_stage_array_scaled_slr #(
             wire lead_run      = lane_chunk_valid[0] &&
                                  (lane_chunk_idx_next[0] != lane_chunk_idx[0]);
             assign chunk_idx_out   = lane_chunk_idx_next[0];
-            // WO-025: odd index leads by 1 the same way (port-B activation
-            // fetch, after the +1 forward seam, re-aligns with the lane's
-            // odd weight). For DUAL_PORT=0 lane_chunk_idx_b_next == even+? is
-            // mirrored to the even-next so this stays == chunk_idx_out.
+            // Secondary activation uses the matching next-chunk lookahead.
             assign chunk_idx_b_out = lane_chunk_idx_b_next[0];
             assign chunk_idx_valid = lead_start || lead_run;
         end
@@ -813,10 +590,7 @@ module gemv_stage_array_scaled_slr #(
 `ifndef SYNTHESIS
     initial if (SLR_SAFE && PIPE_STAGES != 1)
         $error("gemv_stage_array_scaled_slr: SLR_SAFE chunk_idx look-ahead supports PIPE_STAGES=1 only (got %0d).", PIPE_STAGES);
-    // Stage-B': the DUAL_PORT lane now HAS a WLAT port (gemv_lane_scaled_stream_dual
-    // WLAT block), so WLAT + DUAL_PORT is PERMITTED (required for the body GEMV's
-    // SLR seam — the D1 stale-by-1 fix). FF_ACT_CACHE remains DUAL_PORT-incompatible
-    // (kept rejected below).
+    // Cache lookahead and sibling batching have narrower supported configs.
     initial if (FF_ACT_CACHE && !SLR_SAFE)
         $error("gemv_stage_array_scaled_slr: FF_ACT_CACHE=1 requires SLR_SAFE=1 (it restructures the SLR-crossing forward/return seam).");
     initial if (FF_ACT_CACHE && DUAL_PORT)
@@ -833,14 +607,8 @@ module gemv_stage_array_scaled_slr #(
             localparam int CNT  = (BASE + LANES_PER_GRP <= LANES)
                                    ? LANES_PER_GRP : (LANES - BASE);
 
-            // G12_K_PATH FIX-1: per-stage RUNTIME chunk count, derived from
-            // the SAME SLR-pipelined stage_sel (st_g[grp]) the weight bank uses
-            // for base addressing — so the count stays aligned with the
-            // activation/weight stream across the seam. CLAMP to the elaborated
-            // N_CHUNKS so it can never exceed the array depth (in the reduced-K
-            // smoke, K_MAX=3072 -> N_CHUNKS=192, so G4=384/G9=512 clamp to 192 =
-            // bit-identical to today; G12=16 < 192 -> the speedup). In the FLASH
-            // K_MAX=8192 build every stage's real count fits and is used exactly.
+            // Use the same delayed stage selector for chunk count and bank
+            // addressing. Reduced-K test configurations clamp to capacity.
             wire [16:0] grp_chunks_real = sg_w_chunks_per_col(st_g[grp]);
             wire [CW-1:0] grp_nc_run =
                 (grp_chunks_real >= 17'(N_CHUNKS)) ? CW'(N_CHUNKS)

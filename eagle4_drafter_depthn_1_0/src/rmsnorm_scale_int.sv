@@ -1,29 +1,10 @@
-// =====================================================================
-// rmsnorm_scale_int.sv
-// RMSNorm scale-engine for EAGLE4 — INT path (lifted from TALOS-V2).
-// =====================================================================
+// Iterative integer inverse-RMS scale engine.
 //
-// Computes scale = 1 / sqrt(mean(x^2) + eps), starting from a 64-bit
-// sum-of-squares input. Outputs a signed scale code whose width defaults
-// to the legacy 16 bits; selected callers may add positive headroom bits.
-//
-// Pipeline:
-//   ST_IDLE → ST_SQRT (32 cycles iterative integer sqrt)
-//          → ST_DIV  (25 cycles iterative integer divide)
-//          → ST_IDLE  (done pulse)
-//
-// Total per call: ~57 cycles.  This runs ONCE per drafter forward
-// (one RMSNorm per stage × ~3 RMSNorms per drafter step = ~3 invocations
-// per forward).  Latency is bounded; not on the critical throughput path.
-//
-// Origin: TALOS-V2-learn/rtl/src/rms_scale_engine.sv (139 lines, Cyclone V).
-// Lifted verbatim to verify it synthesizes on V80 Versal HBM; the
-// algorithm is fixed-point integer, fully portable.
-//
-// Future wrapper (next sub-task): consume fp32 sumsq accumulator,
-// convert to the INT64 expected here, then convert the Q4.12 scale
-// output back to fp32 for the scale-apply DSP58 pipeline.
-// =====================================================================
+// radicand = ((sumsq>>4) + EPS_BUCKET)<<12, stored in 64 bits.
+// Compute floor(sqrt(radicand)) in 32 steps, then floor(2^24/root) in
+// 25 restoring-division steps. Clamp to the signed SCALE_WIDTH maximum.
+// A zero/tiny root bypasses division and returns the maximum immediately.
+// The caller scales sumsq to account for vector length and activation format.
 
 `timescale 1ns/1ps
 `default_nettype none
@@ -112,7 +93,7 @@ module rmsnorm_scale_int #(
                     busy <= 1'b0;
                     if (start) begin
                         busy <= 1'b1;
-                        // TALOS scales radicand by 4096 (one Q4.12 unit) and adds eps; preserve.
+                        // Bucket the mean-square input and add epsilon before sqrt.
                         radicand_reg <= (((sumsq >> 4) + EPS_BUCKET) << 12);
                         rem_reg <= 66'd0;
                         root_reg <= 33'd0;
@@ -154,6 +135,7 @@ module rmsnorm_scale_int #(
                 end
 
                 ST_DIV: begin
+                    // Restoring divide; the final quotient is width-saturated below.
                     div_in_bit     = (div_bit_reg == 6'd24);
                     div_rem_next   = {div_rem_reg[31:0], div_in_bit};
                     div_quot_next  = div_quot_reg;

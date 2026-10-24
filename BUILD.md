@@ -39,6 +39,12 @@ Tier A smoke test (`eagle4_drafter_depthn_1_0/sim_local/tb/tb_eagle4_drafter.sv`
 - **Configuration**: Overrides `G8_SPLICE=0`, `DEPTH_N=0`, `EMBG_EN=0` to single-step execution; exercises write-DMA (`m_axi_out`) without HBM round-trips.
 - **Load paths**: Random weights/scales loaded via direct-drive pins (`boot_we`, `tb_sc_we`); EMB/HFC/GAMMA loaded via AXI4-Lite registers (`sim_local/tb/eagle4_regmap_pkg.sv`). Verified via `dbg_residency.sv`.
 - **Known simulation caveats**:
+  - Current source defaults set `CONNECT_SEAMS=0`; the testbench's external
+    `a_chunk` is zero, so G4 does not numerically exercise the G1→G4 connection.
+  - The fast smoke's immediate PMEM pointer read can report 3 rather than 4
+    after four writes, before the final registered commit. The G1-only path
+    polls for commit. The general smoke prints failed checks but uses `$finish`,
+    so inspect its final verdict rather than trusting exit status alone.
   - `SCALE` residency reads 0: `dbg_residency.sv:7686` monitors `dma_sc_we`, missing `tb_sc_we`. Functional data still loads into `scale_bram`.
   - RoPE table uninitialized: `rope_layer.sv:284, 328` hardcodes missing path `/home/y344shi/eagle4_artifacts/p4/rope_cs.hex`. `cos_t=sin_t=0` zeroes Q/K outputs in `rope_pair_rotate.sv`, rendering downstream output weight-independent.
   - Performance: ~100–130 µs sim time/s. RTL contains snapshot logic (`SIM_WSNAP`, `+WSNAP_DUMP`, `+WSNAP_LOAD` in `weight_bank_uram.sv`), but it is not yet wired into `run_sim.sh`.
