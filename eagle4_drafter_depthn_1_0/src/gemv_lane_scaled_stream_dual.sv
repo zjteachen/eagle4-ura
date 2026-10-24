@@ -2,9 +2,11 @@
 // gemv_lane_scaled_stream_dual.sv — dual-port scaled GEMV lane
 // =====================================================================
 // Consumes even and odd K_PAR chunks per cycle through two integer MAC/CSA
-// paths. Pair sums are folded into each GROUP partial sum, then one signed
-// fixed-point scale multiply is applied at the group boundary. CPG must be
-// an even power of two: pair boundaries share a scale and indexing uses shifts.
+// paths. Pair sums are folded into each runtime-sized group partial sum, then
+// one signed fixed-point scale multiply is applied at the group boundary.
+// chunks_per_scale_group is validated upstream to {4, 8}; both are even, so a
+// pair never straddles a group boundary, but the lane still derives group
+// boundaries from the latched runtime value rather than a compile-time CPG.
 // Odd terminal counts mask the out-of-range odd member. WLAT=1 delays both
 // weights and tags by one cycle for a registered activation seam.
 // =====================================================================
@@ -17,7 +19,6 @@ module gemv_lane_scaled_stream_dual #(
     parameter int K           = 64,
     parameter int K_PAR       = 16,
     parameter int A_WIDTH     = 16,
-    parameter int GROUP       = 128,      // GPTQ group_size
     parameter int SCALE_WIDTH = 16,       // signed scale
     parameter int SCALE_FRAC  = 15,       // fractional bits (informational)
     parameter int RES_WIDTH   = 48,       // scaled fixed-point accumulator width
@@ -26,9 +27,10 @@ module gemv_lane_scaled_stream_dual #(
     parameter bit WLAT        = 1'b0,
     parameter int N_CHUNKS    = K / K_PAR,
     parameter int CW          = (N_CHUNKS <= 1) ? 1 : $clog2(N_CHUNKS + 2),
-    parameter int CPG         = GROUP / K_PAR,                    // chunks/group (8)
-    parameter int N_GROUPS    = (K + GROUP - 1) / GROUP,
-    parameter int GW          = (N_GROUPS <= 1) ? 1 : $clog2(N_GROUPS + 1),
+    // Worst-case group count at the minimum supported runtime group length.
+    parameter int CPG_MIN     = 4,
+    parameter int N_GROUPS_MAX = (N_CHUNKS + CPG_MIN - 1) / CPG_MIN,
+    parameter int GW          = (N_GROUPS_MAX <= 1) ? 1 : $clog2(N_GROUPS_MAX + 1),
     // pair-walk count width (ceil(N_CHUNKS/2))
     parameter int N_PAIRS     = (N_CHUNKS + 1) / 2,
     parameter int PW          = (N_PAIRS <= 1) ? 1 : $clog2(N_PAIRS + 2)
@@ -47,6 +49,8 @@ module gemv_lane_scaled_stream_dual #(
     input  wire        [1:0]               qz_raw,
     // Per-group dequant scale, held for the CURRENT group
     input  wire signed [SCALE_WIDTH-1:0]   scale_q,
+    // Runtime chunks per scale group, validated upstream to {4, 8}.
+    input  wire        [15:0]              chunks_per_scale_group,
 
     // Runtime terminal chunk count, latched at start; zero selects N_CHUNKS.
     input  wire        [CW-1:0]            n_chunks_run,
@@ -71,13 +75,7 @@ module gemv_lane_scaled_stream_dual #(
     output reg                             done
 );
 
-`ifndef SYNTHESIS
-    initial if (CPG[0] != 1'b0)
-        $error("gemv_lane_scaled_stream_dual: CPG (GROUP/K_PAR=%0d) must be EVEN for the dual-port pair/group alignment.", CPG);
-`endif
-
     localparam int CSA_LAT  = 3;
-    localparam int CPG_BITS = (CPG <= 1) ? 1 : $clog2(CPG);
 
     // Forward declares for the FSM (driven by the two CSA trees below).
     wire signed [25:0] csa_sum_e, csa_sum_o;
@@ -97,11 +95,21 @@ module gemv_lane_scaled_stream_dual #(
     // Effective terminal chunk count, latched at start (same as single-port).
     // ----------------------------------------------------------------
     logic [CW-1:0] nc_run_q;
+    logic [15:0]   cpg_run_q;
     wire  [CW-1:0] nc_eff = (nc_run_q == '0) ? CW'(N_CHUNKS) : nc_run_q;
     always_ff @(posedge clk) begin
-        if (!rst_n)                            nc_run_q <= '0;
-        else if (state_is_idle && start)       nc_run_q <= n_chunks_run;
+        if (!rst_n) begin
+            nc_run_q  <= '0;
+            cpg_run_q <= '0;
+        end else if (state_is_idle && start) begin
+            nc_run_q  <= n_chunks_run;
+            cpg_run_q <= chunks_per_scale_group;
+        end
     end
+
+    // Runtime group geometry: 4 -> shift 2, 8 -> shift 3, supported set only.
+    wire [3:0]    cpg_shift = (cpg_run_q == 16'd4) ? 4'd2 : 4'd3;
+    wire [CW-1:0] cpg_mask  = CW'(cpg_run_q - 16'd1);
 
     // number of PAIRS to walk = ceil(nc_eff/2)
     wire [PW-1:0] np_eff = PW'((nc_eff + CW'(1)) >> 1);
@@ -153,10 +161,11 @@ module gemv_lane_scaled_stream_dual #(
     assign chunk_idx_b_next_out = even_next + CW'(1);
     assign chunk_idx_valid      = (state == S_RUN);
 
-    // Group index = even_chunk / CPG (== odd_chunk/CPG for even CPG). Current +
-    // next for the scale-BRAM 1-cycle lookahead.
-    wire [CW-1:0] grp_cur_full  = (CPG <= 1) ? even_cur  : (even_cur  >> CPG_BITS);
-    wire [CW-1:0] grp_next_full = (CPG <= 1) ? even_next : (even_next >> CPG_BITS);
+    // Group index = even_chunk >> cpg_shift (odd member shares the group for
+    // every supported even group length). Current + next for the scale-BRAM
+    // 1-cycle lookahead.
+    wire [CW-1:0] grp_cur_full  = even_cur  >> cpg_shift;
+    wire [CW-1:0] grp_next_full = even_next >> cpg_shift;
     assign group_idx_out      = grp_cur_full[GW-1:0];
     assign group_idx_next_out = grp_next_full[GW-1:0];
 
@@ -268,16 +277,16 @@ module gemv_lane_scaled_stream_dual #(
     // Tag each PAIR at issue with its group, last-in-group, and the scale the
     // caller drove for that group; shift CSA_LAT deep to line up with the
     // pair-CSA result. Identical idiom to gemv_lane_scaled_stream.
-    wire [CW-1:0] grp_issue_full = (CPG <= 1) ? even_issue : (even_issue >> CPG_BITS);
+    wire [CW-1:0] grp_issue_full = even_issue >> cpg_shift;
     wire [GW-1:0] grp_issue      = grp_issue_full[GW-1:0];
 
-    // group's last VALID chunk = min((grp+1)*CPG-1, nc_eff-1).
-    wire [CW-1:0] grp_end_full = ((grp_issue_full + CW'(1)) << CPG_BITS) - CW'(1);
-    wire [CW-1:0] grp_last     = (grp_end_full < (nc_eff - CW'(1)))
-                                 ? grp_end_full : (nc_eff - CW'(1));
-    // does THIS pair contain grp_last? odd member if odd_valid, else even member.
-    wire last_in_grp_issue = odd_valid_issue ? ((even_issue + CW'(1)) == grp_last)
-                                             : (even_issue == grp_last);
+    // Does THIS pair contain the last VALID chunk of its runtime group?
+    // The terminal pair's odd member may be masked, so use the last valid
+    // chunk index of the pair. cpt is validated divisible by the group
+    // length, so the final group always ends on a full boundary.
+    wire [CW-1:0] pair_last_chunk = odd_valid_issue ? (even_issue + CW'(1))
+                                                   : even_issue;
+    wire last_in_grp_issue = ((pair_last_chunk & cpg_mask) == cpg_mask);
     wire issue_valid = mac_in_valid;
 
     logic [GW-1:0]                 grp_sr  [0:CSA_LAT-1];

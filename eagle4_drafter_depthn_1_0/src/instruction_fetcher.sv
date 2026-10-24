@@ -23,13 +23,19 @@
 *               and high immediates are bytes 127 and 0 and execution
 *               resumes at PC 1; at PC 127 they are bytes 0 and 1 and
 *               execution resumes at PC 2.
-*   100..111   Reserved. Decodes as HALT (fail-safe stop) so an
-*               under-programmed PMEM can never free-run the pipeline.
+*   100        GEMV. The ONLY defined operand is byte 0x80 (operand 0).
+*               Pulse `gemv_pulse` once and hold PC until the shared GEMV
+*               controller reports operation done or a validated config
+*               error (adv_en). Other operands of opcode 100, and every
+*               other reserved opcode, decode as HALT (fail-safe stop).
 *
 * Execution runs from PC=0 after each `start_en` pulse and ends at HALT.
 * A STATE instruction is presented to the decoder for exactly one cycle
 * via `state_pulse`; `is_state`/`state_id` stay valid for the whole wait
-* so downstream muxes (e.g. stage_sel) can decode them combinationally.
+* so downstream muxes can decode them combinationally. A STATE operand
+* whose bit is clear in `state_valid_mask` (retired or unassigned) is
+* treated as HALT, so an obsolete program cannot hang the PC or start a
+* migrated engine path.
 */
 
 module instruction_fetcher (
@@ -40,6 +46,9 @@ module instruction_fetcher (
     input  logic        write_en,   // Active-high PMEM write strobe
     input  logic [7:0]  write_addr, // Target word address in PMEM
     input  logic [31:0] write_data, // 32-bit word written to PMEM
+    // Bit i = STATE operand i is implemented by this build. Cleared bits
+    // (retired shared-stage IDs and unassigned IDs) decode as HALT.
+    input  logic [31:0] state_valid_mask,
     output logic [7:0]  instr,      // 8-bit (1 byte) instruction output
     output logic [6:0]  pc_out,     // Current program counter (0..127)
     output logic        state_pulse,// 1-cycle pulse when a STATE instruction begins
@@ -49,11 +58,14 @@ module instruction_fetcher (
     output logic        halted,     // 1-cycle pulse when HALT/reserved opcode executes
     output logic        sr_write_en,   // 1-cycle WRSR bank write strobe
     output logic [4:0]  sr_write_sel,  // WRSR register address
-    output logic [15:0] sr_write_data  // WRSR immediate (little-endian bytes)
+    output logic [15:0] sr_write_data, // WRSR immediate (little-endian bytes)
+    output logic        gemv_pulse,    // 1-cycle pulse at GEMV 0x80 start
+    output logic        is_gemv        // Level: current instruction is GEMV
 );
     localparam logic [2:0] OP_STATE = 3'b000;
     localparam logic [2:0] OP_JMP   = 3'b001;
     localparam logic [2:0] OP_WRSR  = 3'b011;
+    localparam logic [7:0] GEMV_OP  = 8'h80;
 
     // 32 words of 32-bit storage (inferred as distributed RAM)
     // Total capacity = 32 words * 4 bytes/word = 128 bytes of instruction stream
@@ -102,16 +114,26 @@ module instruction_fetcher (
     assign pc_out = PC;
 
     wire [2:0] op = instr[7:5];
-    // JMP and WRSR execute autonomously (no done to wait for); HALT and
-    // reserved opcodes stop execution.
+    // A STATE operand must be implemented in this build; retired/unassigned
+    // operand bits decode as HALT rather than waiting forever for a done that
+    // no longer exists.
+    wire       state_ok = state_valid_mask[instr[4:0]];
+    wire       state_instr = (op == OP_STATE) && state_ok;
+    wire       gemv_instr  = (instr == GEMV_OP);
+    // JMP and WRSR execute autonomously (no done to wait for); GEMV and a
+    // valid STATE hold the PC until adv_en; HALT/reserved/unknown operands
+    // stop execution.
     wire jmp_exec  = run_q && (op == OP_JMP);
     wire wrsr_exec = run_q && (op == OP_WRSR);
-    wire halt_exec = run_q && (op != OP_STATE) && (op != OP_JMP) &&
-                     (op != OP_WRSR);
+    wire gemv_exec = run_q && gemv_instr;
+    wire halt_exec = run_q && !state_instr && !jmp_exec && !wrsr_exec &&
+                     !gemv_exec;
 
     assign state_id    = instr[4:0];
-    assign is_state    = run_q && (op == OP_STATE);
-    assign state_pulse = new_instr && run_q && (op == OP_STATE);
+    assign is_state    = run_q && state_instr;
+    assign state_pulse = new_instr && run_q && state_instr;
+    assign is_gemv     = gemv_exec;
+    assign gemv_pulse  = new_instr && gemv_exec && !start_en;
     assign running     = run_q;
     assign halted      = new_instr && halt_exec;
 

@@ -424,7 +424,13 @@ module control_regs #(
     output reg  [4:0]  sr_read_sel,
     output reg         sr_read_en,
     input  wire [15:0] sr_read_data,
-    input  wire        sr_read_ack
+    input  wire        sr_read_ack,
+
+    // Shared GEMV engine status (0x170) and active tile (0x174).
+    input  wire        gemv_busy,
+    input  wire        gemv_done_sticky,
+    input  wire        gemv_error_sticky,
+    input  wire [15:0] gemv_active_tile
 );
 
     // ----------------------------------------------------------------
@@ -974,6 +980,11 @@ module control_regs #(
                     // ISA PMEM status / read-back (0x168: write_addr, 0x16C: {canary, PC, fetch_instr})
                     9'h168:  s_axi_control_rdata <= {24'b0, pmem_write_addr};
                     9'h16c:  s_axi_control_rdata <= {16'h504D, 1'b0, fetch_pc, fetch_instr};
+                    // Shared GEMV engine status: bit0 BUSY, bit1 sticky DONE,
+                    // bit2 sticky ERROR. 0x174: active engine tile index.
+                    9'h170:  s_axi_control_rdata <= {29'b0, gemv_error_sticky,
+                                                     gemv_done_sticky, gemv_busy};
+                    9'h174:  s_axi_control_rdata <= {16'b0, gemv_active_tile};
                     9'h178:  s_axi_control_rdata <= {27'b0, sr_read_sel};
                     9'h17c: begin
                         // Selector was latched by a previous 0x178 write.

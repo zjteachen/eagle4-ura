@@ -8,9 +8,11 @@
 //     (URAM-resident), NOT an external port.
 //   - The lane's chunk_idx_out drives the weight_bank_multistage's
 //     chunk_idx, so each lane reads its weights in lockstep with its FSM.
-//   - col_offset per lane = lane_idx + tile_idx * LANES, where tile_idx
-//     is an external input letting the upstream FSM time-multiplex
-//     across the N output columns (for N > LANES).
+//   - The shared operation controller supplies the explicit per-tile weight
+//     base (cfg_weight_base) and runtime chunk bound (cfg_chunks_per_tile).
+//     This dedicated unscaled engine is outside the scaled ISA numeric path,
+//     but it consumes the same controller API so there is ONE owner of the
+//     tile loop and base settle.
 //
 // At LANES=128:
 //   - URAM banks: 128 × 12 URAMs = 1,536 URAMs = 79.8% V80
@@ -40,9 +42,10 @@ module gemv_stage_array_uram #(
     input  wire signed [K_PAR*A_WIDTH-1:0]   a_chunk,
     input  wire        [1:0]                 qz_raw,
 
-    // Stage selector + tile offset for time-multiplexed N>LANES
-    input  wire        [3:0]                 stage_sel,
-    input  wire        [15:0]                tile_idx,         // column block index
+    // Explicit per-tile weight base (flat 32-bit word address) and runtime
+    // per-tile chunk bound, both supplied by the shared operation controller.
+    input  wire        [16:0]                cfg_weight_base,
+    input  wire        [15:0]                cfg_chunks_per_tile,
 
     // Boot-time weight load (single shared write port; the upstream
     // boot-mode FSM streams writes to one lane at a time via lane_we_sel)
@@ -76,17 +79,9 @@ module gemv_stage_array_uram #(
     genvar i;
     generate
         for (i = 0; i < LANES; i = i + 1) begin : g_lane
-            // M1 FIX (2026-05-22): col_offset is the LOCAL column index within
-            // this lane's URAM bank (= tile_idx, range 0..N/LANES-1). The
-            // generate-loop index `i` already selects the physical per-lane bank,
-            // so `i` must NOT appear in the intra-bank address. The previous
-            // `i + tile_idx*LANES` (global column j) overflowed BANK_DEPTH by 8×
-            // for tile_idx>0 (e.g. G6 lane127 tile23 needed addr 608064 vs depth
-            // 77824). Latent until M1 because PDI #2/#3 never loaded weights.
-            // Lane i, tile t holds global output column j = i + t*LANES at local
-            // column t; the extractor writes column j's weights to lane (j%LANES)
-            // at flat addr stage_base + (j//LANES)*cpc + chunk. See M1_WEIGHT_MAP.md.
-            wire [15:0] col_offset = tile_idx[15:0];
+            // The controller supplies the flat per-tile weight base in word
+            // address units; the generate-loop index already selects this
+            // lane's physical bank, so no lane term appears in the address.
 
             // Per-lane weight bank
             wire [31:0] qw_lane;
@@ -100,10 +95,10 @@ module gemv_stage_array_uram #(
             ) u_bank (
                 .clk(clk), .rst_n(rst_n),
                 .we(lane_we), .wr_addr(wr_addr), .wr_data(wr_data),
-                .stage_sel(stage_sel),
-                .col_offset(col_offset),
+                .cfg_base(cfg_weight_base),
                 .chunk_idx({{(16-CW){1'b0}}, lane_chunk_idx_next[i]}),
-                .rd_data(qw_lane)
+                .rd_data(qw_lane),
+                .chunk_idx_b(16'd0), .rd_data_b()
             );
 
             // Per-lane streaming GEMV
@@ -115,6 +110,7 @@ module gemv_stage_array_uram #(
                 .a_chunk(a_chunk),
                 .qw_word(qw_lane),
                 .qz_raw(qz_raw),
+                .n_chunks_run(cfg_chunks_per_tile[CW-1:0]),
                 .chunk_idx_out(lane_chunk_idx[i]),
                 .chunk_idx_valid(lane_chunk_valid[i]),
                 .chunk_idx_next_out(lane_chunk_idx_next[i]),

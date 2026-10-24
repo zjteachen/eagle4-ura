@@ -1,12 +1,12 @@
 // =====================================================================
 // gemv_lane_scaled_stream.sv — single-port scaled GEMV lane
 // =====================================================================
-// Consumes one K_PAR-wide integer MAC chunk per cycle. Each GROUP-sized
-// integer partial sum is multiplied by its signed fixed-point scale at the
-// group boundary and accumulated into result_q. SCALED=0 retains the INT32
-// path. n_chunks_run is latched at start; zero selects N_CHUNKS.
-// WLAT=1 delays weight, valid/tag, and scale by one cycle for a registered
-// activation seam; WLAT=0 is direct alignment.
+// Consumes one K_PAR-wide integer MAC chunk per cycle. Each runtime-sized
+// group (chunks_per_scale_group, supported values 4 and 8) is multiplied by
+// its signed fixed-point scale at the group boundary and accumulated into
+// result_q. SCALED=0 retains the INT32 path. n_chunks_run is latched at
+// start; zero selects N_CHUNKS. WLAT=1 delays weight, valid/tag, and scale
+// by one cycle for a registered activation seam; WLAT=0 is direct alignment.
 // =====================================================================
 
 `timescale 1ns/1ps
@@ -17,7 +17,6 @@ module gemv_lane_scaled_stream #(
     parameter int K           = 64,
     parameter int K_PAR       = 16,
     parameter int A_WIDTH     = 16,
-    parameter int GROUP       = 128,      // GPTQ group_size
     parameter int SCALE_WIDTH = 16,       // signed fixed-point scale width
     parameter int SCALE_FRAC  = 15,       // scale fractional bits (informational)
     parameter int RES_WIDTH   = 48,       // scaled fixed-point accumulator width
@@ -26,10 +25,12 @@ module gemv_lane_scaled_stream #(
     parameter bit WLAT        = 1'b0,
     parameter int N_CHUNKS    = K / K_PAR,
     parameter int CW          = (N_CHUNKS <= 1) ? 1 : $clog2(N_CHUNKS + 2),
-    // chunks per group, and group-count width
-    parameter int CPG         = GROUP / K_PAR,
-    parameter int N_GROUPS    = (K + GROUP - 1) / GROUP,
-    parameter int GW          = (N_GROUPS <= 1) ? 1 : $clog2(N_GROUPS + 1)
+    // Minimum supported runtime group length (chunks). The group-index width
+    // covers the worst case at this length, so a runtime selection of 4 does
+    // not alias two groups or truncate the group tag pipeline.
+    parameter int CPG_MIN     = 4,
+    parameter int N_GROUPS_MAX = (N_CHUNKS + CPG_MIN - 1) / CPG_MIN,
+    parameter int GW          = (N_GROUPS_MAX <= 1) ? 1 : $clog2(N_GROUPS_MAX + 1)
 ) (
     input  wire                            clk,
     input  wire                            rst_n,
@@ -43,6 +44,10 @@ module gemv_lane_scaled_stream #(
     input  wire        [1:0]               qz_raw,
     // Signed fixed-point scale, held for the current input group.
     input  wire signed [SCALE_WIDTH-1:0]   scale_q,
+    // Runtime chunks per scale group. The shared controller validates this
+    // to the supported set {4, 8}; the lane latches it at start so a group
+    // walk cannot change underneath an active tile.
+    input  wire        [15:0]              chunks_per_scale_group,
 
     // Number of chunks for this launch; zero selects N_CHUNKS.
     // Caller must bound nonzero counts to the elaborated capacity.
@@ -80,13 +85,27 @@ module gemv_lane_scaled_stream #(
     logic [CW-1:0] drain_count, drain_count_n;
     logic [CW-1:0] outs_recvd,  outs_recvd_n;
 
-    // Latch the runtime bound so it cannot change during an active walk.
+    // Latch the runtime bound and group length so they cannot change during
+    // an active walk. chunks_per_scale_group is validated upstream to {4, 8};
+    // the latch also keeps the group tag pipeline consistent if the bank is
+    // rewritten between operations.
     logic [CW-1:0] nc_run_q;
+    logic [15:0]   cpg_run_q;
     wire   [CW-1:0] nc_eff = (nc_run_q == '0) ? CW'(N_CHUNKS) : nc_run_q;
     always_ff @(posedge clk) begin
-        if (!rst_n)                        nc_run_q <= '0;
-        else if (state == S_IDLE && start) nc_run_q <= n_chunks_run;
+        if (!rst_n) begin
+            nc_run_q  <= '0;
+            cpg_run_q <= '0;
+        end else if (state == S_IDLE && start) begin
+            nc_run_q  <= n_chunks_run;
+            cpg_run_q <= chunks_per_scale_group;
+        end
     end
+
+    // Runtime group geometry: 4 -> shift 2, 8 -> shift 3. The controller
+    // rejects every other value, so this is not a silent fallback.
+    wire [3:0] cpg_shift = (cpg_run_q == 16'd4) ? 4'd2 : 4'd3;
+    wire [CW-1:0] cpg_mask = CW'(cpg_run_q - 16'd1);
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -126,11 +145,10 @@ module gemv_lane_scaled_stream #(
     assign chunk_idx_next_out = chunk_idx_n;
     assign chunk_idx_valid    = (state == S_RUN);
 
-    // Group index = chunk_idx / CPG  (CPG is a power of two for GROUP/K_PAR).
-    // Expose current + next for the scale-BRAM 1-cycle lookahead.
-    localparam int CPG_BITS = (CPG <= 1) ? 1 : $clog2(CPG);
-    wire [CW-1:0] grp_cur_full  = (CPG <= 1) ? chunk_idx   : (chunk_idx   >> CPG_BITS);
-    wire [CW-1:0] grp_next_full = (CPG <= 1) ? chunk_idx_n : (chunk_idx_n >> CPG_BITS);
+    // Group index = chunk_idx >> cpg_shift (runtime 4/8). Expose current +
+    // next (the next index drives the scale-BRAM 1-cycle lookahead).
+    wire [CW-1:0] grp_cur_full  = chunk_idx   >> cpg_shift;
+    wire [CW-1:0] grp_next_full = chunk_idx_n >> cpg_shift;
     assign group_idx_out      = grp_cur_full[GW-1:0];
     assign group_idx_next_out = grp_next_full[GW-1:0];
 
@@ -219,19 +237,15 @@ module gemv_lane_scaled_stream #(
         // chunk's group at issue time and shift it down the pipe alongside
         // the csa data so the scaled accumulate uses the RIGHT group.
         //
-        // group_at_issue = chunk_idx / CPG, captured when in S_RUN. A
-        // CSA_LAT-stage shift register carries (group, last_in_group, valid)
-        // so it lines up with csa_out_valid.
-        localparam int CPG_B = CPG_BITS;
-
-        // WLAT-aware issue: use the (optionally 1-cycle-delayed) issue_chunk_idx +
-        // mac_in_valid so the group tag tracks the delayed weight/enable when WLAT=1
-        // (and is bit+cycle identical to chunk_idx/(state==S_RUN) when WLAT=0).
-        wire [CW-1:0] grp_issue_full = (CPG <= 1) ? issue_chunk_idx : (issue_chunk_idx >> CPG_B);
+        // group_at_issue = issue_chunk_idx >> cpg_shift, captured when the
+        // (WLAT-aware) issue fires. A CSA_LAT-stage shift register carries
+        // (group, last_in_group, valid) so it lines up with csa_out_valid.
+        // The mask/last test uses the LATCHED runtime group length, so both
+        // 4 and 8 produce the same boundary semantics.
+        wire [CW-1:0] grp_issue_full = issue_chunk_idx >> cpg_shift;
         wire [GW-1:0] grp_issue      = grp_issue_full[GW-1:0];
-        // last chunk in this group? (issue_chunk_idx mod CPG == CPG-1)
-        wire last_in_grp_issue = (CPG <= 1) ? 1'b1
-                                            : (issue_chunk_idx[CPG_B-1:0] == (CPG-1));
+        // last chunk in this group? (issue_chunk_idx mod cpg == cpg-1)
+        wire last_in_grp_issue = ((issue_chunk_idx & cpg_mask) == cpg_mask);
         wire issue_valid = mac_in_valid;
 
         // Shift register matched to csa pipeline depth (CSA_LAT cycles).

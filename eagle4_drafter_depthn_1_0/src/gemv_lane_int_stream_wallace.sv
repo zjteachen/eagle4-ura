@@ -43,6 +43,9 @@ module gemv_lane_int_stream_wallace #(
     input  wire        [31:0]              qw_word,
     // Per-group qzero (one 2-bit value)
     input  wire        [1:0]               qz_raw,
+    // Runtime terminal chunk count, latched at start; zero selects N_CHUNKS.
+    // The shared controller bounds this to the elaborated capacity.
+    input  wire        [CW-1:0]            n_chunks_run,
 
     // FSM exposes the chunk index it expects; caller drives a_chunk and
     // qw_word consistent with this chunk.
@@ -80,6 +83,14 @@ module gemv_lane_int_stream_wallace #(
 
     localparam int CSA_LAT = 3;
 
+    // Latch the runtime terminal count (zero selects the elaborated maximum).
+    logic [CW-1:0] nc_run_q;
+    wire  [CW-1:0] nc_eff = (nc_run_q == '0) ? CW'(N_CHUNKS) : nc_run_q;
+    always_ff @(posedge clk) begin
+        if (!rst_n)                        nc_run_q <= '0;
+        else if (state == S_IDLE && start) nc_run_q <= n_chunks_run;
+    end
+
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             state <= S_IDLE; chunk_idx <= '0; drain_count <= '0; outs_recvd <= '0;
@@ -98,14 +109,14 @@ module gemv_lane_int_stream_wallace #(
                 drain_count_n = '0; outs_recvd_n = '0;
             end
             S_RUN: begin
-                if (chunk_idx == N_CHUNKS - 1) begin
+                if (chunk_idx == nc_eff - 1'b1) begin
                     state_n = S_DRAIN; drain_count_n = '0;
                 end else chunk_idx_n = chunk_idx + 1'b1;
                 if (csa_out_valid) outs_recvd_n = outs_recvd + 1'b1;
             end
             S_DRAIN: begin
                 if (csa_out_valid) outs_recvd_n = outs_recvd + 1'b1;
-                if (outs_recvd == N_CHUNKS) state_n = S_DONE;
+                if (outs_recvd == nc_eff) state_n = S_DONE;
                 else if (drain_count >= CSA_LAT + 2) state_n = S_DONE;
                 drain_count_n = drain_count + 1'b1;
             end

@@ -73,7 +73,6 @@ proc init_gui { IPINST } {
   ipgui::add_param $IPINST -name "OUT_PARENT_SENTINEL" -parent ${Page_0}
   ipgui::add_param $IPINST -name "OUT_TOP_K" -parent ${Page_0}
   ipgui::add_param $IPINST -name "PRECISION_SAFE" -parent ${Page_0}
-  ipgui::add_param $IPINST -name "PREFETCH_COL_P" -parent ${Page_0}
   ipgui::add_param $IPINST -name "R4_BANKSPLIT" -parent ${Page_0}
   ipgui::add_param $IPINST -name "REQUANT_HEADMUX" -parent ${Page_0}
   ipgui::add_param $IPINST -name "ROPE_CS_PIPE" -parent ${Page_0}
@@ -724,15 +723,6 @@ proc validate_PARAM_VALUE.PRECISION_SAFE { PARAM_VALUE.PRECISION_SAFE } {
 	return true
 }
 
-proc update_PARAM_VALUE.PREFETCH_COL_P { PARAM_VALUE.PREFETCH_COL_P } {
-	# Procedure called to update PREFETCH_COL_P when any of the dependent parameters in the arguments change
-}
-
-proc validate_PARAM_VALUE.PREFETCH_COL_P { PARAM_VALUE.PREFETCH_COL_P } {
-	# Procedure called to validate PREFETCH_COL_P
-	return true
-}
-
 proc update_PARAM_VALUE.R4_BANKSPLIT { PARAM_VALUE.R4_BANKSPLIT } {
 	# Procedure called to update R4_BANKSPLIT when any of the dependent parameters in the arguments change
 }
@@ -1046,11 +1036,6 @@ proc update_MODELPARAM_VALUE.LMDOWN_MEM_DIR_P { MODELPARAM_VALUE.LMDOWN_MEM_DIR_
 proc update_MODELPARAM_VALUE.D1_LAT { MODELPARAM_VALUE.D1_LAT PARAM_VALUE.D1_LAT } {
 	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
 	set_property value [get_property value ${PARAM_VALUE.D1_LAT}] ${MODELPARAM_VALUE.D1_LAT}
-}
-
-proc update_MODELPARAM_VALUE.PREFETCH_COL_P { MODELPARAM_VALUE.PREFETCH_COL_P PARAM_VALUE.PREFETCH_COL_P } {
-	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
-	set_property value [get_property value ${PARAM_VALUE.PREFETCH_COL_P}] ${MODELPARAM_VALUE.PREFETCH_COL_P}
 }
 
 proc update_MODELPARAM_VALUE.D1_RDLAT { MODELPARAM_VALUE.D1_RDLAT PARAM_VALUE.D1_RDLAT } {

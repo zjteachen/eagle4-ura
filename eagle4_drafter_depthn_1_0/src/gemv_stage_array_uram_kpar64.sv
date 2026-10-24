@@ -54,9 +54,13 @@ module gemv_stage_array_uram_kpar64 #(
     input  wire signed [K_PAR*A_WIDTH-1:0]   a_chunk,
     input  wire        [1:0]                 qz_raw,
 
-    // Stage selector + tile offset for time-multiplexed N>LANES
-    input  wire        [3:0]                 stage_sel,
-    input  wire        [15:0]                tile_idx,         // column block index
+    // Explicit per-tile weight base in K_PAR=16 WORD address units plus the
+    // runtime ISA chunk bound (16-element chunks). This wide bank stores rows
+    // of N_SG words, so the array converts both to row units. The shared
+    // operation controller supplies these values; this dedicated K_PAR64
+    // engine is outside the scaled ISA numeric path but uses the same API.
+    input  wire        [16:0]                cfg_weight_base,
+    input  wire        [15:0]                cfg_chunks_per_tile,
 
     // Boot-time weight load. The boot FSM selects the target lane
     // (lane_we_sel) and presents one WIDE row (N_SG words) at wr_row_data,
@@ -85,12 +89,16 @@ module gemv_stage_array_uram_kpar64 #(
     assign chunk_idx_valid = lane_chunk_valid[0];
     assign done = &lane_done;
 
+    // Convert the ISA word base / 16-element chunk count into this array's
+    // N_SG-word row units. The production layouts (stage bases and every
+    // supported chunks_per_tile) are N_SG-aligned; the controller validates
+    // bank capacity in word units.
+    wire [16:0] cfg_row_base = cfg_weight_base / 17'(N_SG);
+    wire [16:0] cfg_rows     = 17'(cfg_chunks_per_tile) / 17'(N_SG);
+
     genvar i;
     generate
         for (i = 0; i < LANES; i = i + 1) begin : g_lane
-            // local column index within this lane's bank (= tile_idx)
-            wire [15:0] col_offset = tile_idx[15:0];
-
             // ---- ONE wide URAM bank per lane (URAM-neutral) ----
             wire [ROW_W-1:0] qw_row;
             wire             lane_we = we && (lane_we_sel == i[15:0]);
@@ -99,8 +107,7 @@ module gemv_stage_array_uram_kpar64 #(
             ) u_bank (
                 .clk(clk), .rst_n(rst_n),
                 .we(lane_we), .wr_row(wr_row[15:0]), .wr_row_data(wr_row_data),
-                .stage_sel(stage_sel),
-                .col_offset(col_offset),
+                .cfg_base_row(cfg_row_base),
                 .chunk_idx({{(16-CW){1'b0}}, lane_chunk_idx_next[i]}),
                 .rd_row(qw_row)
             );
@@ -117,6 +124,7 @@ module gemv_stage_array_uram_kpar64 #(
                 .a_chunk(a_chunk),
                 .qw_word(qw_row),
                 .qz_raw(qz_raw),
+                .n_chunks_run(cfg_rows[CW-1:0]),
                 .chunk_idx_out(lane_chunk_idx[i]),
                 .chunk_idx_valid(lane_chunk_valid[i]),
                 .chunk_idx_next_out(lane_chunk_idx_next[i]),

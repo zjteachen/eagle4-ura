@@ -68,8 +68,6 @@ module eagle4_drafter #(
 
     parameter bit  D1_LAT          = `EAGLE4_D1_LAT,
 
-    parameter bit  PREFETCH_COL_P  = `EAGLE4_PREFETCH_COL_P,
-
     parameter bit  D1_RDLAT        = `EAGLE4_D1_RDLAT,
     parameter bit  D1_WLAT         = `EAGLE4_D1_WLAT,
 
@@ -230,10 +228,10 @@ module eagle4_drafter #(
     input  wire                       m_axi_out_bvalid,
     output wire                       m_axi_out_bready,
 
-    // External activation inputs.
+    // External activation-source stream (activation_source = 0). The
+    // operation configuration (including qzero) comes only from the actual
+    // special-register bank latched by gemv_shared_ctrl.
     input  wire signed [K_PAR*A_WIDTH-1:0]  a_chunk,
-    input  wire        [1:0]                qz_raw,
-    input  wire        [15:0]               tile_idx,
 
     // G8 lm-head gather master.
     output wire [BOOT_AXI_ID_W-1:0]   m_axi_g8_arid,
@@ -320,7 +318,7 @@ module eagle4_drafter #(
     wire [31:0] inj_en_wdata_w, inj_widx_wdata_w, inj_data_wdata_w, inj_sel_wdata_w;
     wire [31:0] inj_en_rb_w, inj_widx_rb_w, inj_status_w;
 
-    wire g4_start,  g4_done;
+    wire g4_done;
     wire g5_start;
     wire g6_start,  g6_done;
     wire g7g_start, g7g_done;
@@ -329,7 +327,7 @@ module eagle4_drafter #(
     wire g9_start,  g9_done;
     wire g11_start;
     wire glm_start, glm_done;
-    wire g12_start, g12_done;
+    wire g12_done;
     wire tree_start;
     wire g1_start;
 
@@ -385,7 +383,7 @@ module eagle4_drafter #(
             .N_TILES(TREE_N_TILES)
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .tree_start(tree_start),
+            .tree_start(tree_start_eff),
             .n_tiles_cfg(n_tiles_cfg),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
@@ -405,7 +403,7 @@ module eagle4_drafter #(
             .N_TILES(TREE_N_TILES)
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .tree_start(tree_start),
+            .tree_start(tree_start_eff),
             .n_tiles_cfg(n_tiles_cfg),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
@@ -447,7 +445,7 @@ module eagle4_drafter #(
             .IDX_W(TREE_IDX_W), .SCORE_W(32), .N_TILES(TREE_N_TILES)
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .tree_start(tree_start),
+            .tree_start(tree_start_eff),
             .n_tiles_cfg(n_tiles_cfg),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
@@ -468,7 +466,7 @@ module eagle4_drafter #(
             .IDX_W(TREE_IDX_W), .SCORE_W(32), .N_TILES(TREE_N_TILES)
         ) u_tree_tiler (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .tree_start(tree_start),
+            .tree_start(tree_start_eff),
             .n_tiles_cfg(n_tiles_cfg),
             .array_acc_out(array_acc_out),
             .array_done(array_done),
@@ -1339,9 +1337,8 @@ module eagle4_drafter #(
     wire       g5_attn_done;
     reg        g5_done_r;
 
-    // G4 captures Q, then K, then V: each projection has 3072 outputs.
-    // At LANES=128 this is 24 tiles per projection, 72 array launches total.
-    localparam int G4_STAGE_SEL = 4'd0;
+    // QKV composite destination: each projection has 3072 outputs.
+    // At LANES=128 this is 24 placement tiles per projection, 72 total.
     localparam int G4_OUT       = 3072;
     localparam int G4_NTILES    = (G4_OUT + LANES - 1) / LANES;
     localparam int G4_TOT_TILES = 3 * G4_NTILES;
@@ -1349,24 +1346,31 @@ module eagle4_drafter #(
 
     wire signed [32*LANES-1:0] g4_tile_slice = array_acc_out;
 
-    reg  g4_start_d;
-
-    wire [15:0] array_tile_idx;
-
-    wire             g4_tile_done = array_done & g4_start_d & (stage_sel == G4_STAGE_SEL);
-    wire [15:0]      g4_lcol      = array_tile_idx;
+    // Q/K/V destination adapter. Destination 9 is the QKV composite: the
+    // first G4_NTILES placement tiles store Q, the next K, the final V.
+    // Destinations 0/1/2 store one projection at output_base + tile.
+    // gemv_store_idx_w already includes output_base.
+    wire [15:0]      g4_lcol      = gemv_store_idx_w;
+    wire             g4_comp      = (gemv_tile_dest_w == 4'd9);
     wire [1:0]       g4_subtile   = (g4_lcol < 16'(G4_NTILES))     ? 2'd0
                                   : (g4_lcol < 16'(2*G4_NTILES))   ? 2'd1
                                   : (g4_lcol < 16'(G4_TOT_TILES))  ? 2'd2
                                   :                                  2'd3;
-
     wire [15:0]      g4_subbase   = (g4_subtile == 2'd0) ? 16'd0
                                   : (g4_subtile == 2'd1) ? 16'(G4_NTILES)
                                   :                        16'(2*G4_NTILES);
-    wire [G4_TW-1:0] g4_ctile     = (g4_lcol - g4_subbase);
-    wire             cap_q_we     = g4_tile_done & (g4_subtile == 2'd0);
-    wire             cap_k_we     = g4_tile_done & (g4_subtile == 2'd1);
-    wire             cap_v_we     = g4_tile_done & (g4_subtile == 2'd2);
+    wire [15:0]      g4_local     = g4_lcol - g4_subbase;
+    wire [G4_TW-1:0] g4_ctile     = g4_comp ? g4_local[G4_TW-1:0]
+                                             : g4_lcol[G4_TW-1:0];
+    wire             cap_q_we     = gemv_tile_qkv &&
+                                    ((gemv_tile_dest_w == 4'd0) ||
+                                     (g4_comp && (g4_subtile == 2'd0)));
+    wire             cap_k_we     = gemv_tile_qkv &&
+                                    ((gemv_tile_dest_w == 4'd1) ||
+                                     (g4_comp && (g4_subtile == 2'd1)));
+    wire             cap_v_we     = gemv_tile_qkv &&
+                                    ((gemv_tile_dest_w == 4'd2) ||
+                                     (g4_comp && (g4_subtile == 2'd2)));
 
     reg signed [32*LANES-1:0] q_full_buf [0:G4_NTILES-1];
     reg signed [32*LANES-1:0] k_full_buf [0:G4_NTILES-1];
@@ -1766,10 +1770,10 @@ module eagle4_drafter #(
         .clk(ap_clk), .rst_n(ap_rst_n),
         .wr_valid(s7a_seam_wr), .wr_chunk_idx('0), .wr_chunk(s7a_cur_chunk),
         .wr_clear(s7a_seam_clear), .wr_count(), .full(seam_g5g6_full),
-        .rd_valid(1'b1), .rd_chunk_idx(array_chunk_idx_out[S7A_CW-1:0]),
+        .rd_valid(1'b1), .rd_chunk_idx(act_addr_w[S7A_CW-1:0]),
         .rd_chunk(seam_g5g6_rd),
 
-        .rd_chunk_idx_b(array_chunk_idx_b_out[S7A_CW-1:0]),
+        .rd_chunk_idx_b(act_addr_b_w[S7A_CW-1:0]),
         .rd_chunk_b(seam_g5g6_rd_b)
     );
 
@@ -1804,10 +1808,9 @@ module eagle4_drafter #(
     wire [15:0] sr_read_data_w;
     wire        sr_read_ack_w;
 
-    // Execution-config fields decoded by the special-register bank. These
-    // hand off to the GEMV operation controller in the next integration
-    // stage (it latches them at START); this stage only stores/readbacks.
-    /* verilator lint_off UNUSEDSIGNAL */
+    // Execution-config fields decoded by the actual special-register bank.
+    // gemv_shared_ctrl latches these at GEMV START / TREE session start and
+    // they are the sole source of bases, bounds, routing and numeric mode.
     wire [15:0] sr_activation_base_w;
     wire [16:0] sr_weight_base_w;
     wire [15:0] sr_tile_count_w;
@@ -1820,7 +1823,35 @@ module eagle4_drafter #(
     wire [1:0]  sr_qzero_raw_w;
     wire [4:0]  sr_scale_frac_w;
     wire [15:0] sr_output_conversion_w;
-    /* verilator lint_on UNUSEDSIGNAL */
+
+    // Shared GEMV operation controller handoff (ISA START and TREE client).
+    wire        fetch_gemv_pulse_w;
+    wire        fetch_is_gemv_w;
+    wire        gemv_busy_w;
+    wire        gemv_done_w;
+    wire        gemv_error_w;
+    wire [15:0] gemv_active_tile_w;
+    wire        gemv_array_start_w;
+    wire [16:0] gemv_arr_weight_base_w;
+    wire [16:0] gemv_arr_scale_base_w;
+    wire [15:0] gemv_arr_chunks_per_tile_w;
+    wire [15:0] gemv_arr_chunks_per_scale_group_w;
+    wire        gemv_tile_valid_w;
+    wire [3:0]  gemv_tile_dest_w;
+    wire [15:0] gemv_store_idx_w;
+    wire        gemv_store_ack_w;
+    wire        gemv_client_error_w;
+    wire        gemv_client_cfg_ok_w;
+    wire        gemv_op_start_w;
+    wire [3:0]  gemv_op_start_dest_w;
+    wire        gemv_op_done_w;
+    wire [3:0]  gemv_op_done_dest_w;
+    wire        gemv_op_error_w;
+    wire [2:0]  gemv_act_src_w;
+    wire [15:0] gemv_act_base_w;
+    wire [1:0]  gemv_qzero_w;
+    wire [4:0]  gemv_scale_frac_w;
+    wire        r6_store_ack;   // dest6 adapter drain (assigned per build)
 
     // AXI4-Lite register file.
     control_regs #(.COL_W(20)) u_ctrl (
@@ -1937,7 +1968,11 @@ module eagle4_drafter #(
         .sr_read_sel(sr_read_sel_w),
         .sr_read_en(sr_read_en_w),
         .sr_read_data(sr_read_data_w),
-        .sr_read_ack(sr_read_ack_w)
+        .sr_read_ack(sr_read_ack_w),
+        .gemv_busy(gemv_busy_w),
+        .gemv_done_sticky(gemv_done_w),
+        .gemv_error_sticky(gemv_error_w),
+        .gemv_active_tile(gemv_active_tile_w)
     );
 
     instruction_fetcher u_fetcher (
@@ -1957,7 +1992,13 @@ module eagle4_drafter #(
         .halted     (isa_halted_w),
         .sr_write_en  (isa_sr_write_en_w),
         .sr_write_sel (isa_sr_write_sel_w),
-        .sr_write_data(isa_sr_write_data_w)
+        .sr_write_data(isa_sr_write_data_w),
+        .gemv_pulse (fetch_gemv_pulse_w),
+        .is_gemv    (fetch_is_gemv_w),
+        // Implemented STATE operands: G1=1, G5=3, G7_SILU=7, G11=9,
+        // TREE=11, GLM=13, G8=14. Retired shared-stage IDs (G4=2, G6=4,
+        // G7G=5, G7U=6, G9=8, G12=10) and unassigned IDs decode as HALT.
+        .state_valid_mask (32'h0000_6A8A)
     );
 
     special_regs u_special_regs (
@@ -2139,99 +2180,171 @@ module eagle4_drafter #(
     // re-implementation.
     // ------------------------------------------------------------------
     localparam logic [4:0] ISA_S_IDLE     = 5'd0;
-    localparam logic [4:0] ISA_S_G1       = 5'd1;
-    localparam logic [4:0] ISA_S_G4       = 5'd2;
-    localparam logic [4:0] ISA_S_G5       = 5'd3;
-    localparam logic [4:0] ISA_S_G6       = 5'd4;
-    localparam logic [4:0] ISA_S_G7G      = 5'd5;
-    localparam logic [4:0] ISA_S_G7U      = 5'd6;
-    localparam logic [4:0] ISA_S_G7_SILU  = 5'd7;
-    localparam logic [4:0] ISA_S_G9       = 5'd8;
-    localparam logic [4:0] ISA_S_G11      = 5'd9;
-    localparam logic [4:0] ISA_S_G12      = 5'd10;
-    localparam logic [4:0] ISA_S_TREE     = 5'd11;
-    localparam logic [4:0] ISA_S_GLM      = 5'd13;
-    localparam logic [4:0] ISA_S_G8       = 5'd14;
+    localparam logic [4:0] ISA_S_G1       = 5'd1;   // implemented
+    localparam logic [4:0] ISA_S_G5       = 5'd3;   // implemented
+    localparam logic [4:0] ISA_S_G7_SILU  = 5'd7;   // implemented
+    localparam logic [4:0] ISA_S_G11      = 5'd9;   // implemented
+    localparam logic [4:0] ISA_S_TREE     = 5'd11;  // implemented
+    localparam logic [4:0] ISA_S_GLM      = 5'd13;  // implemented
+    localparam logic [4:0] ISA_S_G8       = 5'd14;  // implemented
+    // Retired shared-stage IDs: G4=2, G6=4, G7G=5, G7U=6, G9=8, G12=10.
+    // The fetcher masks them to HALT (state_valid_mask above); GEMV opcode
+    // 0x80 is the only path that launches the shared engine now.
 
     // A STATE instruction stays at its PMEM byte until its stage done
-    // fires. The wait register selects WHICH done advances the PC — a raw
-    // OR of all dones is unsafe: g8_done is a sticky level held high until
-    // the next launch, so it would free-run the PC during the following
-    // pass. Waiting one cycle after issue before sampling also lets
-    // launch-cleared sticky dones (g8_done, cleared by tree_start) drop
-    // first, mirroring the FSM's state-entry-then-sample sequence.
+    // fires; a GEMV byte stays until the operation reports done or a
+    // validated configuration error. The wait register selects WHICH event
+    // advances the PC plus a GEMV tag, so no raw OR of dones can free-run
+    // the PC and a rejected GEMV can never hang the program.
     reg        isa_wait;
     reg [4:0]  isa_wait_id;
+    reg        isa_wait_gemv;
     wire       isa_adv;
 
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
-            isa_wait    <= 1'b0;
-            isa_wait_id <= ISA_S_IDLE;
+            isa_wait      <= 1'b0;
+            isa_wait_id   <= ISA_S_IDLE;
+            isa_wait_gemv <= 1'b0;
+        end else if (start_pulse) begin
+            // A host restart clears any pending wait of the previous program.
+            isa_wait      <= 1'b0;
+            isa_wait_id   <= ISA_S_IDLE;
+            isa_wait_gemv <= 1'b0;
         end else if (isa_state_pulse_w) begin
-            isa_wait    <= 1'b1;
-            isa_wait_id <= isa_state_id_w;
+            isa_wait      <= 1'b1;
+            isa_wait_id   <= isa_state_id_w;
+            isa_wait_gemv <= 1'b0;
+        end else if (fetch_gemv_pulse_w) begin
+            isa_wait      <= 1'b1;
+            isa_wait_id   <= ISA_S_IDLE;
+            isa_wait_gemv <= 1'b1;
         end else if (isa_adv) begin
-            isa_wait    <= 1'b0;
+            isa_wait      <= 1'b0;
+            isa_wait_gemv <= 1'b0;
         end
     end
 
     // G1 advances on the hidden norm's done, not a join of both norms.
-    // Their scale engines can have different latencies; G4 separately waits
-    // for both full-width R1 buffers before issuing its first tile.
-    wire isa_done =
+    // TREE also terminates on a rejected client request so an invalid G12
+    // configuration cannot hang the ISA program.
+    wire isa_state_done =
           (isa_wait_id == ISA_S_G1)      ? g1_done        :
-          (isa_wait_id == ISA_S_G4)      ? g4_done        :
           (isa_wait_id == ISA_S_G5)      ? g5_done        :
-          (isa_wait_id == ISA_S_G6)      ? g6_done_stage  :
-          (isa_wait_id == ISA_S_G7G)     ? g7g_done_stage :
-          (isa_wait_id == ISA_S_G7U)     ? g7u_done_stage :
           (isa_wait_id == ISA_S_G7_SILU) ? g7p_done       :
-          (isa_wait_id == ISA_S_G9)      ? g9_done_stage  :
           (isa_wait_id == ISA_S_G11)     ? g11_done       :
-          (isa_wait_id == ISA_S_G12)     ? g12_done       :
-          (isa_wait_id == ISA_S_TREE)    ? tree_done      :
+          (isa_wait_id == ISA_S_TREE)    ? (tree_done | gemv_client_error_w) :
           (isa_wait_id == ISA_S_GLM)     ? glm_done       :
           (isa_wait_id == ISA_S_G8)      ? g8_done        : 1'b0;
-    assign isa_adv = isa_wait && isa_done;
+    wire isa_gemv_done = gemv_op_done_w | gemv_op_error_w;
+    assign isa_adv = isa_wait && (isa_wait_gemv ? isa_gemv_done : isa_state_done);
 
-    // Stage starts: one-cycle pulse on STATE instruction entry, exactly
-    // like the FSM's state-entry pulses (edge-sensitive consumers include
-    // the seam-FIFO wr_clear pins).
+    // STATE starts remain for the non-shared stages that still own real
+    // side effects (norm, attention, SiLU, G11, GLM, TREE, G8).
     assign g1_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G1);
-    assign g4_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G4);
     assign g5_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G5);
-    assign g6_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G6);
-    assign g7g_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7G);
-    assign g7u_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7U);
     assign g7p_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G7_SILU);
-    assign g9_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G9);
     assign g11_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G11);
-    assign glm_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_GLM);
-    assign g12_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_G12);
     assign tree_start = isa_state_pulse_w && (isa_state_id_w == ISA_S_TREE);
+    assign glm_start  = isa_state_pulse_w && (isa_state_id_w == ISA_S_GLM);
     assign g8_start   = isa_state_pulse_w && (isa_state_id_w == ISA_S_G8);
 
-    // stage_sel decodes the CURRENT instruction for its whole duration
-    // (the byte stays at PC while the stage runs), so it is valid in the
-    // same cycle as the start pulse — matching the FSM's combinational
-    // state decode (same mapping: S_G4->0 ... S_G12->5).
-    assign stage_sel = !isa_is_state_w ? 4'd0 :
-          (isa_state_id_w == ISA_S_G4)  ? 4'd0 :
-          (isa_state_id_w == ISA_S_G6)  ? 4'd1 :
-          (isa_state_id_w == ISA_S_G7G) ? 4'd2 :
-          (isa_state_id_w == ISA_S_G7U) ? 4'd3 :
-          (isa_state_id_w == ISA_S_G9)  ? 4'd4 :
-          (isa_state_id_w == ISA_S_G12) ? 4'd5 : 4'd0;
+    // Shared-engine destination start/clear pulses now come from the GEMV
+    // operation controller, not retired STATE operands. They retain the
+    // seam wr_clear / residual-trigger side effects of the old stages.
+    assign g6_start  = gemv_op_start_w && (gemv_op_start_dest_w == 4'd3);
+    assign g7g_start = gemv_op_start_w && (gemv_op_start_dest_w == 4'd4);
+    assign g7u_start = gemv_op_start_w && (gemv_op_start_dest_w == 4'd5);
+    assign g9_start  = gemv_op_start_w && (gemv_op_start_dest_w == 4'd6);
+    // Standalone G12 STATE program start removed: TREE is the sole G12
+    // client and drives tt_gemv_start through the same controller.
+
+    // Observation-only stage view: while a shared GEMV operation (including
+    // a TREE client tile) is active, expose the destination's legacy stage
+    // code so probes/stage capture keep their existing attribution. Non-
+    // GEMV cycles expose 0 (the shared engine is the only array driver).
+    wire [3:0] gemv_stage_view =
+          ((gemv_tile_dest_w == 4'd9) || (gemv_tile_dest_w == 4'd0) ||
+           (gemv_tile_dest_w == 4'd1) || (gemv_tile_dest_w == 4'd2)) ? 4'd0 :
+          (gemv_tile_dest_w == 4'd3) ? 4'd1 :
+          (gemv_tile_dest_w == 4'd4) ? 4'd2 :
+          (gemv_tile_dest_w == 4'd5) ? 4'd3 :
+          (gemv_tile_dest_w == 4'd6) ? 4'd4 :
+          (gemv_tile_dest_w == 4'd7) ? 4'd5 : 4'd0;
+    assign stage_sel = gemv_busy_w ? gemv_stage_view : 4'd0;
 
     // Kernel handshake: busy while the program runs, one-cycle done on
     // HALT (control_regs clears ap_start off kernel_busy, so start_pulse
     // is a clean single cycle).
     assign kernel_busy = isa_running_w;
     assign kernel_done = isa_halted_w;
-    // Debug tap replacing 5'(u_fsm.state): reports the state ID for the
-    // whole duration of each STATE instruction (0 while idle/at HALT).
-    wire [4:0] isa_dbg_state = isa_is_state_w ? isa_state_id_w : ISA_S_IDLE;
+    // Debug tap: state ID for a STATE instruction, 31 for GEMV, else 0.
+    wire [4:0] isa_dbg_state = isa_is_state_w ? isa_state_id_w :
+                               (fetch_is_gemv_w ? 5'd31 : ISA_S_IDLE);
+
+    // ------------------------------------------------------------------
+    // Sole shared GEMV operation controller. ISA GEMV (0x80) and the TREE
+    // client both use the SAME latched special-register configuration.
+    // ------------------------------------------------------------------
+    wire gemv_act_ready_w;   // source readiness, assigned with the source mux
+    gemv_shared_ctrl #(
+        .LANES(LANES), .K_PAR(K_PAR), .K_MAX(K_MAX),
+        .G9_NTILES(FORREASON ? (6144 / LANES) : (3072 / LANES))
+    ) u_gemv_ctrl (
+        .clk(ap_clk), .rst_n(ap_rst_n),
+        .isa_start(fetch_gemv_pulse_w),
+        .cfg_activation_base(sr_activation_base_w),
+        .cfg_weight_base(sr_weight_base_w),
+        .cfg_tile_count(sr_tile_count_w),
+        .cfg_chunks_per_tile(sr_chunks_per_tile_w),
+        .cfg_chunks_per_scale_group(sr_chunks_per_scale_group_w),
+        .cfg_output_base(sr_output_base_w),
+        .cfg_scale_base(sr_scale_base_w),
+        .cfg_activation_source(sr_activation_source_w),
+        .cfg_output_destination(sr_output_destination_w),
+        .cfg_qzero_raw(sr_qzero_raw_w),
+        .cfg_scale_frac(sr_scale_frac_w),
+        .cfg_output_conversion(sr_output_conversion_w),
+        .act_ready(gemv_act_ready_w),
+        .array_done(array_done),
+        .array_start(gemv_array_start_w),
+        .arr_weight_base(gemv_arr_weight_base_w),
+        .arr_scale_base(gemv_arr_scale_base_w),
+        .arr_chunks_per_tile(gemv_arr_chunks_per_tile_w),
+        .arr_chunks_per_scale_group(gemv_arr_chunks_per_scale_group_w),
+        .tile_valid(gemv_tile_valid_w),
+        .tile_dest(gemv_tile_dest_w),
+        .store_idx(gemv_store_idx_w),
+        .store_ack(gemv_store_ack_w),
+        .client_session_start(tree_start),
+        .client_active(tt_stage_g12),
+        .client_start(tt_gemv_start),
+        .client_tile_idx(tt_gemv_tile_idx),
+        .client_error(gemv_client_error_w),
+        .client_config_ok(gemv_client_cfg_ok_w),
+        .busy(gemv_busy_w),
+        .done_sticky(gemv_done_w),
+        .error_sticky(gemv_error_w),
+        .active_tile(gemv_active_tile_w),
+        .op_start(gemv_op_start_w),
+        .op_start_dest(gemv_op_start_dest_w),
+        .op_done(gemv_op_done_w),
+        .op_done_dest(gemv_op_done_dest_w),
+        .op_error(gemv_op_error_w),
+        .latched_valid(),
+        .latched_activation_source(gemv_act_src_w),
+        .latched_activation_base(gemv_act_base_w),
+        .latched_qzero_raw(gemv_qzero_w),
+        .latched_scale_frac(gemv_scale_frac_w),
+        .latched_destination(),
+        .latched_output_conversion(),
+        .latched_tile_count()
+    );
+
+    // An invalid TREE configuration must not start an empty tree walk. The
+    // controller still sees the raw tree_start so it can latch/validate and
+    // terminate the ISA wait via client_error; only the tiler start is gated.
+    wire tree_start_eff = tree_start && gemv_client_cfg_ok_w;
 
     // Depth-N loop control is not expressible in the current ISA (its
     // sequencing is data-dependent on branch_j/level_i and the level_done
@@ -2597,36 +2710,55 @@ module eagle4_drafter #(
     wire signed [K_PAR*A_WIDTH-1:0] g6_act_in_b =
         S7A_FRONT_SEQ ? seam_g5g6_rd_b : attn_out_chunk_latched;
 
-    assign premlp_rd_idx = array_chunk_idx_out[PREMLP_CW-1:0];
+    // ------------------------------------------------------------------
+    // Activation-source routing. act_addr = latched activation_base + the
+    // array's exposed chunk lookahead. Adding the base to the ADDRESS (not
+    // just muxing source data) keeps the SLR lookahead/alignment contract
+    // and lets one operation start at any supported chunk offset.
+    // Sources: 0 external stream, 1 h_fc, 2 input_emb, 3 R1, 4 pre-MLP/R2,
+    //          5 R5, 6 low-rank, 7 attention (G5 -> G6).
+    // External has no addressable base (the controller requires base 0).
+    // ------------------------------------------------------------------
+    wire [16:0] act_addr_w   = {1'b0, gemv_act_base_w} + {1'b0, array_chunk_idx_out};
+    wire [16:0] act_addr_b_w = {1'b0, gemv_act_base_w} + {1'b0, array_chunk_idx_b_out};
 
-    wire [PREMLP_CW-1:0] premlp_rd_idx_b = array_chunk_idx_b_out[PREMLP_CW-1:0];
+    assign premlp_rd_idx = act_addr_w[PREMLP_CW-1:0];
 
-    // Connected G4 input is R1 = [embedding_norm, hidden_norm].
-    // With CONNECT_SEAMS=0, G4 instead consumes the external a_chunk port.
-    wire [3:0] act_stage_sel = tt_stage_g12 ? 4'd5 : stage_sel;
-    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_connected =
-          (act_stage_sel == 4'd0) ? seam_r1_rd
-        : (act_stage_sel == 4'd1) ? g6_act_in
-        : (act_stage_sel == 4'd2) ? seam_premlp_rd
-        : (act_stage_sel == 4'd3) ? seam_premlp_rd
-        : (act_stage_sel == 4'd4) ? seam_r5_rd
-        : (act_stage_sel == 4'd5) ? low_rank_rd
-        :                           a_chunk;
+    wire [PREMLP_CW-1:0] premlp_rd_idx_b = act_addr_b_w[PREMLP_CW-1:0];
 
-    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_real =
-        CONNECT_SEAMS ? a_chunk_connected
-                      : ((stage_sel == 4'd1) ? g6_act_in : a_chunk);
+    // HFC / input-embedding banks are combinational array reads; register
+    // them once to match the RD_LAT=1 seam buffers on the other sources.
+    reg signed [K_PAR*A_WIDTH-1:0] hfc_act_rd_w,  hfc_act_rd_b_w;
+    reg signed [K_PAR*A_WIDTH-1:0] emb_act_rd_w,  emb_act_rd_b_w;
+    always_ff @(posedge ap_clk) begin
+        hfc_act_rd_w   <= h_fc_buf_rd(act_addr_w[EMB_CW-1:0]);
+        hfc_act_rd_b_w <= h_fc_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+        emb_act_rd_w   <= input_emb_buf_rd(act_addr_w[EMB_CW-1:0]);
+        emb_act_rd_b_w <= input_emb_buf_rd(act_addr_b_w[EMB_CW-1:0]);
+    end
 
-    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_b_connected =
-          (act_stage_sel == 4'd0) ? seam_r1_rd_b
-        : (act_stage_sel == 4'd1) ? g6_act_in_b
-        : (act_stage_sel == 4'd2) ? seam_premlp_rd_b
-        : (act_stage_sel == 4'd3) ? seam_premlp_rd_b
-        : (act_stage_sel == 4'd4) ? seam_r5_rd_b
-        : (act_stage_sel == 4'd5) ? low_rank_rd_b
-        :                           '0;
-    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_b_mux =
-        CONNECT_SEAMS ? a_chunk_b_connected : '0;
+    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_src =
+          (gemv_act_src_w == 3'd0) ? a_chunk
+        : (gemv_act_src_w == 3'd1) ? hfc_act_rd_w
+        : (gemv_act_src_w == 3'd2) ? emb_act_rd_w
+        : (gemv_act_src_w == 3'd3) ? seam_r1_rd
+        : (gemv_act_src_w == 3'd4) ? seam_premlp_rd
+        : (gemv_act_src_w == 3'd5) ? seam_r5_rd
+        : (gemv_act_src_w == 3'd6) ? low_rank_rd
+        : (gemv_act_src_w == 3'd7) ? g6_act_in
+        :                            '0;
+
+    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_b_src =
+          (gemv_act_src_w == 3'd0) ? '0
+        : (gemv_act_src_w == 3'd1) ? hfc_act_rd_b_w
+        : (gemv_act_src_w == 3'd2) ? emb_act_rd_b_w
+        : (gemv_act_src_w == 3'd3) ? seam_r1_rd_b
+        : (gemv_act_src_w == 3'd4) ? seam_premlp_rd_b
+        : (gemv_act_src_w == 3'd5) ? seam_r5_rd_b
+        : (gemv_act_src_w == 3'd6) ? low_rank_rd_b
+        : (gemv_act_src_w == 3'd7) ? g6_act_in_b
+        :                            '0;
+
 `ifndef SYNTHESIS
     initial if (DUAL_PORT && !(GEMV_SCALED && !GEMV_KPAR64 && CONNECT_SEAMS
                                && S7A_FRONT_SEQ && BACK_SEQ && SEAM_R1_FULLW
@@ -2646,115 +2778,29 @@ module eagle4_drafter #(
             assign inj_act_chunk[gia*A_WIDTH +: A_WIDTH] = inj_bus[gia*32 +: A_WIDTH];
         end
     endgenerate
+    // Debug injection stays a source-side override; the enable bit follows
+    // the selected activation source's historical stage slot.
     wire inj_gemv_active =
-          (act_stage_sel == 4'd0) ? inject_en[1]
-        : (act_stage_sel == 4'd1) ? inject_en[5]
-        : (act_stage_sel == 4'd2) ? inject_en[6]
-        : (act_stage_sel == 4'd3) ? inject_en[7]
-        : (act_stage_sel == 4'd4) ? inject_en[9]
-        : (act_stage_sel == 4'd5) ? inject_en[12]
-        :                           1'b0;
+          (gemv_act_src_w == 3'd3) ? inject_en[1]
+        : (gemv_act_src_w == 3'd7) ? inject_en[5]
+        : (gemv_act_src_w == 3'd4) ? inject_en[6]
+        : (gemv_act_src_w == 3'd5) ? inject_en[9]
+        : (gemv_act_src_w == 3'd6) ? inject_en[12]
+        :                            1'b0;
     wire signed [K_PAR*A_WIDTH-1:0] a_chunk_mux =
-        inj_gemv_active ? inj_act_chunk : a_chunk_real;
+        inj_gemv_active ? inj_act_chunk : a_chunk_src;
+    wire signed [K_PAR*A_WIDTH-1:0] a_chunk_b_mux =
+        inj_gemv_active ? '0 : a_chunk_b_src;
 
-    function automatic [15:0] bk_stage_ntiles;
-        input [3:0] ssel;
-        begin
-            case (ssel)
-
-                4'd1: bk_stage_ntiles = 16'(3072 / LANES);
-                4'd2: bk_stage_ntiles = 16'(8192 / LANES);
-                4'd3: bk_stage_ntiles = 16'(8192 / LANES);
-
-                4'd4: bk_stage_ntiles = FORREASON ? 16'(6144 / LANES) : 16'(3072 / LANES);
-                default: bk_stage_ntiles = 16'd1;
-            endcase
-        end
-    endfunction
-    wire bk_stage_active = BACK_SEQ && !tt_stage_g12 &&
-                           ((stage_sel == 4'd1) || (stage_sel == 4'd2) ||
-                            (stage_sel == 4'd3) || (stage_sel == 4'd4));
-
-    wire bk_stage_start = (stage_sel == 4'd1) ? g6_start
-                        : (stage_sel == 4'd2) ? g7g_start
-                        : (stage_sel == 4'd3) ? g7u_start
-                        : (stage_sel == 4'd4) ? g9_start
-                        :                       1'b0;
-
-    wire bk_input_full = (stage_sel == 4'd2) ? seam_premlp_full
-                       : (stage_sel == 4'd3) ? seam_premlp_full
-                       : (stage_sel == 4'd4) ? seam_r5_full
-                       :                       1'b1;
-
-    typedef enum logic [1:0] {
-        BKSQ_IDLE   = 2'd0,
-        BKSQ_SETTLE = 2'd1,
-        BKSQ_ISSUE  = 2'd2,
-        BKSQ_WAIT   = 2'd3
-    } bkseq_state_e;
-    bkseq_state_e        bkseq_state;
-    reg [15:0]           bk_tile_cnt;
-    reg [15:0]           bk_ntiles_lat;
-    reg [3:0]            bk_stage_lat;
-    reg                  bk_seq_start_r;
-    reg                  bk_g6_done_r, bk_g7g_done_r, bk_g7u_done_r, bk_g9_done_r;
-    always_ff @(posedge ap_clk) begin
-        if (!ap_rst_n) begin
-            bkseq_state    <= BKSQ_IDLE;
-            bk_tile_cnt    <= '0;
-            bk_ntiles_lat  <= 16'd1;
-            bk_stage_lat   <= 4'd0;
-            bk_seq_start_r <= 1'b0;
-            bk_g6_done_r   <= 1'b0; bk_g7g_done_r <= 1'b0;
-            bk_g7u_done_r  <= 1'b0; bk_g9_done_r  <= 1'b0;
-        end else begin
-            bk_seq_start_r <= 1'b0;
-            bk_g6_done_r   <= 1'b0;
-            bk_g7g_done_r  <= 1'b0;
-            bk_g7u_done_r  <= 1'b0;
-            bk_g9_done_r   <= 1'b0;
-            case (bkseq_state)
-                BKSQ_IDLE: begin
-
-                    if (bk_stage_active && bk_stage_start) begin
-                        bk_tile_cnt   <= '0;
-                        bk_ntiles_lat <= bk_stage_ntiles(stage_sel);
-                        bk_stage_lat  <= stage_sel;
-                        bkseq_state   <= BKSQ_SETTLE;
-                    end
-                end
-                BKSQ_SETTLE: begin
-
-                    if (bk_tile_cnt != 16'd0 || bk_input_full)
-                        bkseq_state <= BKSQ_ISSUE;
-                end
-                BKSQ_ISSUE: begin
-                    bk_seq_start_r <= 1'b1;
-                    bkseq_state    <= BKSQ_WAIT;
-                end
-                BKSQ_WAIT: begin
-                    if (array_done) begin
-                        if (bk_tile_cnt == bk_ntiles_lat - 16'd1) begin
-
-                            case (bk_stage_lat)
-                                4'd1: bk_g6_done_r  <= 1'b1;
-                                4'd2: bk_g7g_done_r <= 1'b1;
-                                4'd3: bk_g7u_done_r <= 1'b1;
-                                4'd4: bk_g9_done_r  <= 1'b1;
-                                default: ;
-                            endcase
-                            bkseq_state <= BKSQ_IDLE;
-                        end else begin
-                            bk_tile_cnt <= bk_tile_cnt + 16'd1;
-                            bkseq_state <= BKSQ_SETTLE;
-                        end
-                    end
-                end
-                default: bkseq_state <= BKSQ_IDLE;
-            endcase
-        end
-    end
-    wire [15:0] bk_seq_tile_idx = bk_tile_cnt;
+    // First-tile source readiness: the controller must not launch before the
+    // producing stage's seam buffer is full. This replaces the old bkseq
+    // SETTLE input-full gate without reintroducing a second tile owner.
+    assign gemv_act_ready_w =
+          (gemv_act_src_w == 3'd3) ? seam_r1_full :
+          (gemv_act_src_w == 3'd4) ? seam_premlp_full :
+          (gemv_act_src_w == 3'd5) ? seam_r5_full :
+          (gemv_act_src_w == 3'd7) ? (S7A_FRONT_SEQ ? seam_g5g6_full : 1'b1) :
+                                     1'b1;
 
     reg [G7_CW:0]  silu_en_cnt;
     reg            silu_en_run;
@@ -2804,88 +2850,8 @@ module eagle4_drafter #(
 
     wire seam_r1_full;
 
-    // G4 tile scheduler: wait for both R1 halves, settle the bank column
-    // address, issue one array launch, then wait for completion. Advance
-    // through all Q/K/V tiles before reporting g4_done.
-    localparam int G4_SEQ_TW = $clog2(G4_TOT_TILES);
-    typedef enum logic [1:0] {
-        G4SQ_IDLE   = 2'd0,
-        G4SQ_SETTLE = 2'd1,
-        G4SQ_ISSUE  = 2'd2,
-        G4SQ_WAIT   = 2'd3
-    } g4seq_state_e;
-    g4seq_state_e            g4seq_state;
-    reg [G4_SEQ_TW-1:0]      g4_tile_cnt;
-    reg                      g4_seq_start_r;
-    reg                      g4_seq_done_r;
-    wire                     g4_in_stage = (stage_sel == G4_STAGE_SEL) && !tt_stage_g12;
-    wire                     g4_seq_en   = S7A_FRONT_SEQ && g4_in_stage;
-    always_ff @(posedge ap_clk) begin
-        if (!ap_rst_n) begin
-            g4seq_state    <= G4SQ_IDLE;
-            g4_tile_cnt    <= '0;
-            g4_seq_start_r <= 1'b0;
-            g4_seq_done_r  <= 1'b0;
-        end else begin
-            g4_seq_start_r <= 1'b0;
-            g4_seq_done_r  <= 1'b0;
-            case (g4seq_state)
-                G4SQ_IDLE: begin
-
-                    if (g4_seq_en && g4_start) begin
-                        g4_tile_cnt <= '0;
-                        g4seq_state <= G4SQ_SETTLE;
-                    end
-                end
-                G4SQ_SETTLE: begin
-
-                    if (g4_tile_cnt != '0 || seam_r1_full)
-                        g4seq_state <= G4SQ_ISSUE;
-                end
-                G4SQ_ISSUE: begin
-                    g4_seq_start_r <= 1'b1;
-                    g4seq_state    <= G4SQ_WAIT;
-                end
-                G4SQ_WAIT: begin
-                    if (array_done) begin
-                        if (g4_tile_cnt == G4_SEQ_TW'(G4_TOT_TILES-1)) begin
-                            g4_seq_done_r <= 1'b1;
-                            g4seq_state   <= G4SQ_IDLE;
-                        end else begin
-                            g4_tile_cnt <= g4_tile_cnt + 1'b1;
-                            g4seq_state <= G4SQ_SETTLE;
-                        end
-                    end
-                end
-                default: g4seq_state <= G4SQ_IDLE;
-            endcase
-        end
-    end
-    wire [15:0] g4_seq_tile_idx = {{(16-G4_SEQ_TW){1'b0}}, g4_tile_cnt};
-
-    wire g4_array_start_raw = S7A_FRONT_SEQ ? g4_seq_start_r : g4_start;
-    wire array_start_fsm_raw = g4_array_start_raw | (BACK_SEQ ? bk_seq_start_r
-                               : (g6_start | g7g_start | g7u_start | g9_start)) | g12_start;
-
-    reg array_start_fsm_q;
-    always_ff @(posedge ap_clk) begin
-        if (!ap_rst_n) array_start_fsm_q <= 1'b0;
-        else           array_start_fsm_q <= array_start_fsm_raw;
-    end
-
-    reg tt_gemv_start_q;
-    always_ff @(posedge ap_clk) begin
-        if (!ap_rst_n) tt_gemv_start_q <= 1'b0;
-        else           tt_gemv_start_q <= tt_gemv_start;
-    end
-    wire array_start     = tt_stage_g12 ? tt_gemv_start_q   : array_start_fsm_q;
-
-    assign array_tile_idx =
-          tt_stage_g12      ? tt_gemv_tile_idx
-        : g4_seq_en         ? g4_seq_tile_idx
-        : bk_stage_active   ? bk_seq_tile_idx
-        :                     tile_idx;
-    wire [3:0]  array_stage_sel = tt_stage_g12 ? 4'd5 /*G12*/    : stage_sel;
+    // The shared array start, per-tile bases and bounds come from the sole
+    // operation controller. No stage-derived launch or tile counter remains.
 
     localparam int ARR_KPAR = GEMV_KPAR64 ? 64 : K_PAR;
     localparam int ARR_NSG  = ARR_KPAR / 16;
@@ -2903,8 +2869,6 @@ module eagle4_drafter #(
 
     wire signed [32*LANES-1:0] array_acc_int;
     assign array_acc_out = array_acc_int;
-
-    wire [1:0] qz_eff = GPTQ_QZERO_RAW;
 
     generate
     if (GEMV_SCALED && !GEMV_KPAR64) begin : g_array_scaled
@@ -2942,13 +2906,11 @@ module eagle4_drafter #(
         (* keep_hierarchy = "yes" *)
         gemv_stage_array_scaled_slr #(
             .K(K_MAX), .K_PAR(K_PAR), .LANES(LANES), .A_WIDTH(A_WIDTH),
-            .GROUP(128), .SCALE_WIDTH(16), .SCALE_FRAC(GEMV_SCALE_FRAC),
+            .SCALE_WIDTH(16), .SCALE_FRAC(GEMV_SCALE_FRAC),
             .RES_WIDTH(RES_W),
             .SLR_SAFE(SLR_SAFE), .N_GROUPS(ARR_GROUPS), .PIPE_STAGES(ARR_PIPE_STAGES),
 
             .FF_ACT_CACHE(FF_ACT_CACHE),
-
-            .PREFETCH_COL(PREFETCH_COL_P),
 
             .WLAT(D1_WLAT),
 
@@ -2956,10 +2918,13 @@ module eagle4_drafter #(
 
             .DUAL_PORT(DUAL_PORT)
         ) u_array (
-            .clk(ap_clk), .rst_n(ap_rst_n), .start(array_start),
-            .a_chunk(a_chunk_wide), .qz_raw(qz_eff),
+            .clk(ap_clk), .rst_n(ap_rst_n), .start(gemv_array_start_w),
+            .a_chunk(a_chunk_wide), .qz_raw(gemv_qzero_w),
             .a_chunk_b(a_chunk_b_mux),
-            .stage_sel(array_stage_sel), .tile_idx(array_tile_idx),
+            .cfg_weight_base(gemv_arr_weight_base_w),
+            .cfg_scale_base(gemv_arr_scale_base_w),
+            .cfg_chunks_per_tile(gemv_arr_chunks_per_tile_w),
+            .cfg_chunks_per_scale_group(gemv_arr_chunks_per_scale_group_w),
             .lane_we_sel(eff_boot_lane_sel), .we(eff_boot_we),
             .wr_addr(eff_boot_wr_addr), .wr_data(eff_boot_wr_data),
             .sc_lane_sel(eff_sc_lane_sel), .sc_we(eff_sc_we),
@@ -2992,13 +2957,16 @@ module eagle4_drafter #(
 
         // Remove the scale's fractional bits from the 48-bit group-summed
         // result: add half, arithmetic-shift, then saturate to signed INT32.
-        // The result retains the activation's fractional-bit convention.
+        // The shift comes from the ACTUAL latched scale_frac field (validated
+        // to 13 at START), not a compile-time constant pretending to be
+        // programmable.
+        wire signed [RES_W-1:0] rq_half =
+            48'sd1 <<< (gemv_scale_frac_w - 5'd1);
         genvar sl;
         for (sl = 0; sl < LANES; sl = sl + 1) begin : g_scaled_requant
             wire signed [RES_W-1:0] rq = result_q_per_lane[sl*RES_W +: RES_W];
-            wire signed [RES_W-1:0] rq_round = rq + $signed({{(RES_W-GEMV_SCALE_FRAC){1'b0}},
-                                                             1'b1, {(GEMV_SCALE_FRAC-1){1'b0}}});
-            wire signed [RES_W-1:0] rq_shr = rq_round >>> GEMV_SCALE_FRAC;
+            wire signed [RES_W-1:0] rq_round = rq + rq_half;
+            wire signed [RES_W-1:0] rq_shr = rq_round >>> gemv_scale_frac_w;
             assign array_acc_int[sl*32 +: 32] =
                   (rq_shr >  $signed({{(RES_W-31){1'b0}}, 31'h7FFFFFFF})) ? 32'sh7FFFFFFF
                 : (rq_shr < -$signed({{(RES_W-32){1'b0}}, 32'h80000000})) ? 32'sh80000000
@@ -3011,9 +2979,10 @@ module eagle4_drafter #(
         gemv_stage_array_uram #(
             .K(K_MAX), .K_PAR(K_PAR), .LANES(LANES), .A_WIDTH(A_WIDTH)
         ) u_array (
-            .clk(ap_clk), .rst_n(ap_rst_n), .start(array_start),
-            .a_chunk(a_chunk_wide), .qz_raw(qz_eff),
-            .stage_sel(array_stage_sel), .tile_idx(array_tile_idx),
+            .clk(ap_clk), .rst_n(ap_rst_n), .start(gemv_array_start_w),
+            .a_chunk(a_chunk_wide), .qz_raw(gemv_qzero_w),
+            .cfg_weight_base(gemv_arr_weight_base_w),
+            .cfg_chunks_per_tile(gemv_arr_chunks_per_tile_w),
             .lane_we_sel(eff_boot_lane_sel), .we(eff_boot_we),
             .wr_addr(eff_boot_wr_addr), .wr_data(eff_boot_wr_data),
             .chunk_idx_out(array_chunk_idx_out),
@@ -3051,9 +3020,10 @@ module eagle4_drafter #(
         gemv_stage_array_uram_kpar64 #(
             .K(K_MAX), .K_PAR(ARR_KPAR), .LANES(LANES), .A_WIDTH(A_WIDTH)
         ) u_array (
-            .clk(ap_clk), .rst_n(ap_rst_n), .start(array_start),
-            .a_chunk(a_chunk_wide), .qz_raw(qz_eff),
-            .stage_sel(array_stage_sel), .tile_idx(array_tile_idx),
+            .clk(ap_clk), .rst_n(ap_rst_n), .start(gemv_array_start_w),
+            .a_chunk(a_chunk_wide), .qz_raw(gemv_qzero_w),
+            .cfg_weight_base(gemv_arr_weight_base_w),
+            .cfg_chunks_per_tile(gemv_arr_chunks_per_tile_w),
             .lane_we_sel(eff_boot_lane_sel), .we(boot_row_we_q),
             .wr_row(boot_row_addr_q), .wr_row_data(boot_row_q),
             .chunk_idx_out(array_chunk_idx_out),
@@ -3064,40 +3034,56 @@ module eagle4_drafter #(
     end
     endgenerate
 
-    reg g6_start_d, g7g_start_d, g7u_start_d, g9_start_d, g12_start_d;
-    wire g6_hold_clear  = BACK_SEQ ? bk_g6_done_r  : array_done;
-    wire g7g_hold_clear = BACK_SEQ ? bk_g7g_done_r : array_done;
-    wire g7u_hold_clear = BACK_SEQ ? bk_g7u_done_r : array_done;
-    wire g9_hold_clear  = BACK_SEQ ? bk_g9_done_r  : array_done;
+    // Per-tile destination events used by the destination adapter and by the
+    // downstream start/done side effects. tile_valid is registered one cycle
+    // after array_done with the array result bus still stable.
+    wire gemv_tile_qkv  = gemv_tile_valid_w && ((gemv_tile_dest_w == 4'd9) ||
+                          (gemv_tile_dest_w == 4'd0) || (gemv_tile_dest_w == 4'd1) ||
+                          (gemv_tile_dest_w == 4'd2));
+    wire gemv_tile_r2   = gemv_tile_valid_w && (gemv_tile_dest_w == 4'd3);
+    wire gemv_tile_r4g  = gemv_tile_valid_w && (gemv_tile_dest_w == 4'd4);
+    wire gemv_tile_r4u  = gemv_tile_valid_w && (gemv_tile_dest_w == 4'd5);
+    wire gemv_tile_r6   = gemv_tile_valid_w && (gemv_tile_dest_w == 4'd6);
+    wire gemv_tile_tree = gemv_tile_valid_w && (gemv_tile_dest_w == 4'd7);
+
+    // Final-operation pulses used by residual/RMSNorm sequencing and debug.
+    wire gemv_done_qkv = gemv_op_done_w && (gemv_op_done_dest_w == 4'd9);
+    wire gemv_done_r2  = gemv_op_done_w && (gemv_op_done_dest_w == 4'd3);
+    wire gemv_done_r4g = gemv_op_done_w && (gemv_op_done_dest_w == 4'd4);
+    wire gemv_done_r4u = gemv_op_done_w && (gemv_op_done_dest_w == 4'd5);
+    wire gemv_done_r6  = gemv_op_done_w && (gemv_op_done_dest_w == 4'd6);
+
+    assign g4_done  = gemv_done_qkv;
+    assign g6_done  = gemv_tile_r2;           // per-tile capture trigger
+    assign g7g_done = gemv_tile_r4g;
+    assign g7u_done = gemv_tile_r4u;
+    assign g9_done  = gemv_tile_r6;
+    assign g12_done = gemv_tile_tree;
+    wire g6_done_stage  = gemv_done_r2;
+    wire g7g_done_stage = gemv_done_r4g;
+    wire g7u_done_stage = gemv_done_r4u;
+    wire g9_done_stage  = gemv_done_r6;
+
+    // Destination store handshake to the controller. Q/K/V (single or
+    // composite) have a one-cycle buffer write; R2/R4/R6 report the last of
+    // their LANE_SUBW serialized subchunk writes. The controller stays in
+    // STORE until this ack, so operation DONE cannot precede the last store.
+    reg        gemv_tile_valid_q;
+    reg [3:0]  gemv_tile_dest_q;
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
-            g4_start_d  <= 1'b0; g6_start_d  <= 1'b0;
-            g7g_start_d <= 1'b0; g7u_start_d <= 1'b0;
-            g9_start_d  <= 1'b0; g12_start_d <= 1'b0;
+            gemv_tile_valid_q <= 1'b0;
+            gemv_tile_dest_q  <= 4'd0;
         end else begin
-
-            if (g4_start)  g4_start_d  <= 1'b1;
-            else if (S7A_FRONT_SEQ ? g4_seq_done_r : array_done) g4_start_d  <= 1'b0;
-            if (g6_start)  g6_start_d  <= 1'b1; else if (g6_hold_clear)  g6_start_d  <= 1'b0;
-            if (g7g_start) g7g_start_d <= 1'b1; else if (g7g_hold_clear) g7g_start_d <= 1'b0;
-            if (g7u_start) g7u_start_d <= 1'b1; else if (g7u_hold_clear) g7u_start_d <= 1'b0;
-            if (g9_start)  g9_start_d  <= 1'b1; else if (g9_hold_clear)  g9_start_d  <= 1'b0;
-            if (g12_start) g12_start_d <= 1'b1; else if (array_done)     g12_start_d <= 1'b0;
+            gemv_tile_valid_q <= gemv_tile_valid_w;
+            gemv_tile_dest_q  <= gemv_tile_dest_w;
         end
     end
-
-    assign g4_done  = S7A_FRONT_SEQ ? g4_seq_done_r : (array_done & g4_start_d);
-    assign g6_done  = array_done & g6_start_d;
-
-    assign g7g_done = array_done & g7g_start_d;
-    assign g7u_done = array_done & g7u_start_d;
-    assign g9_done  = array_done & g9_start_d;
-    assign g12_done = array_done & g12_start_d;
-
-    wire g6_done_stage  = BACK_SEQ ? bk_g6_done_r  : g6_done;
-    wire g7g_done_stage = BACK_SEQ ? bk_g7g_done_r : g7g_done;
-    wire g7u_done_stage = BACK_SEQ ? bk_g7u_done_r : g7u_done;
-    wire g9_done_stage  = BACK_SEQ ? bk_g9_done_r  : g9_done;
+    wire gemv_store_ack_imm = gemv_tile_valid_q &&
+        ((gemv_tile_dest_q == 4'd0) || (gemv_tile_dest_q == 4'd1) ||
+         (gemv_tile_dest_q == 4'd2) || (gemv_tile_dest_q == 4'd9));
+    assign gemv_store_ack_w = gemv_store_ack_imm | r2_store_ack |
+                              g7g_store_ack | g7u_store_ack | r6_store_ack;
 
     localparam int SEAM_H = K_PAR;
 
@@ -3169,7 +3155,7 @@ module eagle4_drafter #(
 
         wire signed [K_PAR*A_WIDTH-1:0] r1f_e_wr_chunk = rms_g1e_out_chunk_eff;
 
-        wire [R1F_FULL_CW-1:0] r1f_rd_idx = array_chunk_idx_out[R1F_FULL_CW-1:0];
+        wire [R1F_FULL_CW-1:0] r1f_rd_idx = act_addr_w[R1F_FULL_CW-1:0];
         wire                   r1f_rd_low = (r1f_rd_idx < R1F_FULL_CW'(3072/K_PAR));
 
         wire [R1F_FULL_CW-1:0] r1f_rd_idx_hi = r1f_rd_idx - R1F_FULL_CW'(3072/K_PAR);
@@ -3188,7 +3174,7 @@ module eagle4_drafter #(
             end
         end
 
-        wire [R1F_FULL_CW-1:0] r1f_rd_idx_b = array_chunk_idx_b_out[R1F_FULL_CW-1:0];
+        wire [R1F_FULL_CW-1:0] r1f_rd_idx_b = act_addr_b_w[R1F_FULL_CW-1:0];
         wire [R1F_FULL_CW-1:0] r1f_rd_idx_b_hi = r1f_rd_idx_b - R1F_FULL_CW'(3072/K_PAR);
         wire [R1F_HALF_CW-1:0] r1f_rd_half_idx_b =
             r1f_rd_low ? r1f_rd_idx_b[R1F_HALF_CW-1:0]
@@ -3262,9 +3248,9 @@ module eagle4_drafter #(
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
             r2_acc_lat <= '0; r2_tile_lat <= '0; r2_we_cnt <= '0; r2_we_active <= 1'b0;
-        end else if (g6_done) begin
+        end else if (gemv_tile_r2) begin
             r2_acc_lat   <= array_acc_out;
-            r2_tile_lat  <= array_tile_idx;
+            r2_tile_lat  <= gemv_store_idx_w;
             r2_we_cnt    <= '0;
             r2_we_active <= 1'b1;
         end else if (r2_we_active) begin
@@ -3273,6 +3259,9 @@ module eagle4_drafter #(
         end
     end
     wire                            r2_seam_we    = r2_we_active;
+    // Destination-store completion: the last of LANE_SUBW subchunk writes.
+    wire                            r2_store_ack =
+        r2_we_active && (r2_we_cnt == (LANE_SUBW-1));
     wire [R2_CW-1:0]                r2_seam_widx  = R2_CW'(int'(r2_tile_lat)*LANE_SUBW + int'(r2_we_cnt));
 
     wire signed [K_PAR*A_WIDTH-1:0] r2_seam_wchunk =
@@ -3283,7 +3272,7 @@ module eagle4_drafter #(
         if (r2_seam_we) g6out_buf[r2_seam_widx] <= r2_seam_wchunk;
     end
 
-    wire [R2_CW-1:0] r2_rd_idx = array_chunk_idx_out[R2_CW-1:0];
+    wire [R2_CW-1:0] r2_rd_idx = act_addr_w[R2_CW-1:0];
     // Inter-stage activation seam storage.
     stage_io_buffer_sel #(.SEAM_FF(SEAM_FF), .H(G6_OUT_N), .K_PAR(K_PAR), .A_WIDTH(A_WIDTH), .AUTO_SEQ(0)) u_seam_r2 (
         .clk(ap_clk), .rst_n(ap_rst_n),
@@ -3351,7 +3340,7 @@ module eagle4_drafter #(
         end else if (g7g_done) begin
 
             g7g_acc_lat   <= array_acc_out;
-            g7g_tile_lat  <= array_tile_idx;
+            g7g_tile_lat  <= gemv_store_idx_w;
             g7g_we_cnt    <= '0;
             g7g_we_active <= 1'b1;
         end else if (g7g_we_active) begin
@@ -3360,6 +3349,8 @@ module eagle4_drafter #(
         end
     end
     wire                        g7g_seam_we   = g7g_we_active;
+    wire                        g7g_store_ack =
+        g7g_we_active && (g7g_we_cnt == (LANE_SUBW-1));
 
     wire [G7_CW-1:0]            g7g_seam_widx = G7_CW'(int'(g7g_tile_lat)*LANE_SUBW + int'(g7g_we_cnt));
 
@@ -3374,7 +3365,7 @@ module eagle4_drafter #(
             g7u_acc_lat <= '0; g7u_tile_lat <= '0; g7u_we_cnt <= '0; g7u_we_active <= 1'b0;
         end else if (g7u_done) begin
             g7u_acc_lat   <= array_acc_out;
-            g7u_tile_lat  <= array_tile_idx;
+            g7u_tile_lat  <= gemv_store_idx_w;
             g7u_we_cnt    <= '0;
             g7u_we_active <= 1'b1;
         end else if (g7u_we_active) begin
@@ -3383,6 +3374,8 @@ module eagle4_drafter #(
         end
     end
     wire                        g7u_seam_we   = g7u_we_active;
+    wire                        g7u_store_ack =
+        g7u_we_active && (g7u_we_cnt == (LANE_SUBW-1));
     wire [G7_CW-1:0]            g7u_seam_widx = G7_CW'(int'(g7u_tile_lat)*LANE_SUBW + int'(g7u_we_cnt));
 
     wire signed [K_PAR*R4_AW-1:0] g7u_seam_wchunk = sat_acc_subchunk_q612(g7u_acc_lat, int'(g7u_we_cnt) * K_PAR);
@@ -3422,9 +3415,9 @@ module eagle4_drafter #(
     localparam int R5_CW      = $clog2(R5_NCHUNKS);
     wire r5_wr = silu_valid;
 
-    wire [R5_CW-1:0] r5_rd_idx = array_chunk_idx_out[R5_CW-1:0];
+    wire [R5_CW-1:0] r5_rd_idx = act_addr_w[R5_CW-1:0];
 
-    wire [R5_CW-1:0] r5_rd_idx_b = array_chunk_idx_b_out[R5_CW-1:0];
+    wire [R5_CW-1:0] r5_rd_idx_b = act_addr_b_w[R5_CW-1:0];
     // Inter-stage activation seam storage.
     stage_io_buffer_sel #(.SEAM_FF(SEAM_FF), .H(R5_H), .K_PAR(K_PAR), .A_WIDTH(A_WIDTH),
                       .AUTO_SEQ(1), .FRAC_BITS(8), .RD_LAT(D1_RDLAT)) u_seam_r5 (
@@ -3451,7 +3444,7 @@ module eagle4_drafter #(
                 g9_acc_lat <= '0; g9_tile_lat <= '0; g9_we_cnt <= '0; g9_we_active <= 1'b0;
             end else if (g9_done) begin
                 g9_acc_lat   <= array_acc_out;
-                g9_tile_lat  <= array_tile_idx;
+                g9_tile_lat  <= gemv_store_idx_w;
                 g9_we_cnt    <= '0;
                 g9_we_active <= 1'b1;
             end else if (g9_we_active) begin
@@ -3459,6 +3452,8 @@ module eagle4_drafter #(
                 g9_we_cnt <= g9_we_cnt + 1'b1;
             end
         end
+        assign r6_store_ack =
+            g9_we_active && (g9_we_cnt == (LANE_SUBW-1));
         wire [R6_CW-1:0]                g9_widx = R6_CW'(int'(g9_tile_lat)*LANE_SUBW + int'(g9_we_cnt));
         wire signed [K_PAR*A_WIDTH-1:0] g9_wchunk =
             sat_acc_subchunk(g9_acc_lat, int'(g9_we_cnt) * K_PAR);
@@ -3477,7 +3472,7 @@ module eagle4_drafter #(
                 r3_a_cnt <= '0; r3_a_run <= 1'b0;
                 r3_b_cnt <= '0; r3_b_run <= 1'b0; r3_started <= 1'b0;
             end else begin
-                if (bk_g6_done_r) begin
+                if (gemv_done_r2) begin
                     r3_a_cnt <= '0; r3_a_run <= 1'b1;
                     r3_b_cnt <= '0; r3_b_run <= 1'b0; r3_started <= 1'b0;
                 end
@@ -3676,7 +3671,7 @@ module eagle4_drafter #(
                 r7_a_cnt <= '0; r7_a_run <= 1'b0;
                 r7_b_cnt <= '0; r7_b_run <= 1'b0; r7_started <= 1'b0;
             end else begin
-                if (bk_g9_done_r) begin
+                if (gemv_done_r6) begin
                     r7_a_cnt <= '0; r7_a_run <= 1'b1;
                     r7_b_cnt <= '0; r7_b_run <= 1'b0; r7_started <= 1'b0;
                 end
@@ -3734,7 +3729,7 @@ module eagle4_drafter #(
             always_ff @(posedge ap_clk) begin
                 if (!ap_rst_n) begin
                     fr_cnt <= '0; fr_run <= 1'b0;
-                end else if (bk_g9_done_r) begin
+                end else if (gemv_done_r6) begin
                     fr_cnt <= '0; fr_run <= 1'b1;
                 end else if (fr_run) begin
                     if (fr_cnt == (R6_CW+1)'(R6_NCHUNKS-1)) fr_run <= 1'b0;
@@ -3837,6 +3832,10 @@ module eagle4_drafter #(
             assign f2_lvl_ge1_w    = 1'b0;
         end
     end else begin : g_resid_pilot
+
+        // Pilot path stores one chunk per tile without the 8-cycle serializer;
+        // the controller's store handshake completes immediately.
+        assign r6_store_ack = 1'b1;
 
         assign f2_fr_rd_data_w = '0;
         assign f2_lvl_ge1_w    = 1'b0;
@@ -4039,9 +4038,9 @@ module eagle4_drafter #(
     wire [31:0] lmtap_word_guard = {8'hA2, 7'b0, lmtap_fired, 15'b0, lmtap_guard_cap};
     wire [31:0] lmtap_word_ad    = {8'hA3, 7'b0, lmtap_fired, lmtap_ad_cap[15:0]};
 
-    wire [LR_OCW-1:0] lr_rd_idx = array_chunk_idx_out[LR_OCW-1:0];
+    wire [LR_OCW-1:0] lr_rd_idx = act_addr_w[LR_OCW-1:0];
 
-    wire [LR_OCW-1:0] lr_rd_idx_b = array_chunk_idx_b_out[LR_OCW-1:0];
+    wire [LR_OCW-1:0] lr_rd_idx_b = act_addr_b_w[LR_OCW-1:0];
 
     localparam int INJ_WIDX_W = $clog2(INJ_MAX_W);
     wire signed [LR_LANES*A_WIDTH-1:0] inj_glm_chunk;

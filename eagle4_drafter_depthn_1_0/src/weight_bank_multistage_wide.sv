@@ -67,75 +67,21 @@ module weight_bank_multistage_wide #(
     input  wire [RADDR_W-1:0]    wr_row,         // ROW address into THIS bank
     input  wire [ROW_W-1:0]      wr_row_data,    // PACK words assembled
 
-    // Compute-time read port
-    input  wire [3:0]            stage_sel,      // 0..5 GEMV stage
-    input  wire [15:0]           col_offset,     // output col within stage (local)
+    // Compute-time read port. cfg_base_row is the explicit per-tile row base
+    // (word base / N_SG), supplied by the shared operation controller.
+    input  wire [16:0]           cfg_base_row,
     input  wire [15:0]           chunk_idx,      // K-chunk within column (0..K/K_PAR-1)
     output wire [ROW_W-1:0]      rd_row          // N_SG words for this chunk
 );
 
-    // -----------------------------------------------------------------
-    // Per-stage ROW base offsets and per-column ROW stride.
-    // The K_PAR=16 baseline (weight_bank_multistage.sv) uses these WORD
-    // bases / strides; here every value is divided by N_SG because rows
-    // hold N_SG words. The TOTAL stored bits are identical (rows × ROW_W =
-    // words × 32). Bases match the M1 WEIGHT-LAYOUT-FIT table exactly.
-    //
-    //   K_PAR=16 word table         -> wide-row table (÷ N_SG)
-    //   G4_qkv base 0     cpc 384    -> base 0/N         cpc 384/N
-    //   G6_o   base 27648 cpc 192    -> base 27648/N     cpc 192/N
-    //   G7_g   base 32256 cpc 192    -> ...
-    //   G7_u   base 44544 cpc 192
-    //   G9     base 56832 cpc 512
-    //   G12    base 81408 cpc 16
-    // -----------------------------------------------------------------
-    function automatic [16:0] stage_base_row(input [3:0] s);
-        case (s)
-            4'd0: stage_base_row = 17'(17'd0     / N_SG); // G4_qkv
-            4'd1: stage_base_row = 17'(17'd27648 / N_SG); // G6_o
-            4'd2: stage_base_row = 17'(17'd32256 / N_SG); // G7_g
-            4'd3: stage_base_row = 17'(17'd44544 / N_SG); // G7_u
-            4'd4: stage_base_row = 17'(17'd56832 / N_SG); // G9_down
-            4'd5: stage_base_row = 17'(17'd81408 / N_SG); // G12_lm
-            default: stage_base_row = 17'd0;
-        endcase
-    endfunction
-
-    function automatic [16:0] stage_rows_per_col(input [3:0] s);
-        case (s)
-            4'd0: stage_rows_per_col = 17'(17'd384 / N_SG); // G4_qkv K=6144
-            4'd1: stage_rows_per_col = 17'(17'd192 / N_SG); // G6   K=3072
-            4'd2: stage_rows_per_col = 17'(17'd192 / N_SG); // G7_g
-            4'd3: stage_rows_per_col = 17'(17'd192 / N_SG); // G7_u
-            4'd4: stage_rows_per_col = 17'(17'd512 / N_SG); // G9   K=8192
-            4'd5: stage_rows_per_col = 17'(17'd16  / N_SG); // G12  K=256
-            default: stage_rows_per_col = 17'd0;
-        endcase
-    endfunction
-
-    // Registered base+col*stride (same timing idiom as the K_PAR=16 bank:
-    // the col multiply only re-evaluates when stage/col change; per-cycle
-    // path is just (registered_offset + chunk_idx) — a 17-bit add).
-    reg  [16:0] col_offset_acc;
-    reg  [3:0]  stage_sel_d;
-    reg  [15:0] col_offset_d;
-
+    // Register the explicit row base; the controller settles it before start.
+    reg [16:0] base_q;
     always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            col_offset_acc <= '0;
-            stage_sel_d    <= '0;
-            col_offset_d   <= '0;
-        end else begin
-            if (stage_sel !== stage_sel_d || col_offset !== col_offset_d) begin
-                col_offset_acc <= stage_base_row(stage_sel) +
-                                  (col_offset * stage_rows_per_col(stage_sel));
-                stage_sel_d    <= stage_sel;
-                col_offset_d   <= col_offset;
-            end
-        end
+        if (!rst_n) base_q <= '0;
+        else        base_q <= cfg_base_row;
     end
 
-    wire [16:0] rd_addr_full = col_offset_acc + chunk_idx;
+    wire [16:0] rd_addr_full = base_q + chunk_idx;
     wire [RADDR_W-1:0] rd_addr = rd_addr_full[RADDR_W-1:0];
 
     // -----------------------------------------------------------------
@@ -148,7 +94,8 @@ module weight_bank_multistage_wide #(
     ) u_uram (
         .clk(clk), .rst_n(rst_n),
         .we(we), .wr_addr(wr_row), .wr_data(wr_row_data),
-        .rd_addr(rd_addr), .rd_data(rd_row)
+        .rd_addr(rd_addr), .rd_data(rd_row),
+        .rd_addr_b('0), .rd_data_b()
     );
 
 endmodule
